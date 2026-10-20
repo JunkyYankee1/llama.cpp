@@ -2377,6 +2377,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
+        // layers outside the layer range are not computed, so their weights are not loaded
+        if (!has_layer(tn.bid)) {
+            flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        }
     }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,

@@ -51,6 +51,7 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
 struct tensor_data_params {
     size_t seed;
     float  stdev;
+    size_t n_bytes = 0; // total size of the tensors set so far
 };
 
 // fills the values of one tensor, the name carries whatever the property needs
@@ -112,6 +113,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
     std::vector<float> tmp(ggml_nelements(tensor));
     fill(tmp, tensor->name, params);
+    ((tensor_data_params *) userdata)->n_bytes += ggml_nbytes(tensor);
 
     if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
@@ -897,8 +899,10 @@ static bool layer_range_supported(const llm_arch arch) {
     }
 }
 
+// n_bytes: if not null, receives the total size of the loaded weights
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_part(
-        struct gguf_context * gguf_ctx, const size_t seed, const float stdev, const int32_t layer_start, const int32_t layer_end) {
+        struct gguf_context * gguf_ctx, const size_t seed, const float stdev, const int32_t layer_start, const int32_t layer_end,
+        size_t * n_bytes = nullptr) {
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     model_params.layer_start = layer_start;
@@ -918,6 +922,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_part(
     llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model part");
+    }
+    if (n_bytes) {
+        *n_bytes = tensor_params.n_bytes;
     }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
@@ -989,7 +996,8 @@ static int test_layer_range(const std::string & arch_filter, const size_t seed, 
             gguf_set_val_u32(gguf_ctx.get(), (std::string(llm_arch_name(arch)) + ".full_attention_interval").c_str(), 2);
         }
 
-        auto [model_full, ctx_full] = get_model_part(gguf_ctx.get(), seed, stdev, 0, 0);
+        size_t size_full = 0;
+        auto [model_full, ctx_full] = get_model_part(gguf_ctx.get(), seed, stdev, 0, 0, &size_full);
         const int32_t n_layer = llama_model_n_layer(model_full.get());
         const int32_t n_embd  = llama_model_n_embd(model_full.get());
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_full.get()));
@@ -999,16 +1007,22 @@ static int test_layer_range(const std::string & arch_filter, const size_t seed, 
 
         for (int32_t split = 1; split < n_layer; split++) {
             for (const int n_chunks : {1, 4}) {
-                auto [model_a, ctx_a] = get_model_part(gguf_ctx.get(), seed, stdev, 0, split);
-                auto [model_b, ctx_b] = get_model_part(gguf_ctx.get(), seed, stdev, split, 0);
+                size_t size_a = 0;
+                size_t size_b = 0;
+                auto [model_a, ctx_a] = get_model_part(gguf_ctx.get(), seed, stdev, 0, split, &size_a);
+                auto [model_b, ctx_b] = get_model_part(gguf_ctx.get(), seed, stdev, split, 0, &size_b);
 
                 const std::vector<float> logits_split = get_logits_split(ctx_a.get(), ctx_b.get(), tokens, n_embd, n_vocab, n_chunks);
                 const double err = nmse(logits_full, logits_split);
-                const bool ok = err <= nmse_thold;
+
+                // each part must not load the weights of the other part's layers
+                const bool size_ok = size_a < size_full && size_b < size_full;
+
+                const bool ok = err <= nmse_thold && size_ok;
                 n_ok   += ok;
                 n_fail += !ok;
-                LOG("%s: %-12s split at layer %d/%d, %d chunk(s): nmse = %.3e %s\n",
-                    __func__, llm_arch_name(arch), split, n_layer, n_chunks, err, ok ? "OK" : "FAIL");
+                LOG("%s: %-12s split at layer %d/%d, %d chunk(s): nmse = %.3e, weights A/B/full = %zu/%zu/%zu bytes %s\n",
+                    __func__, llm_arch_name(arch), split, n_layer, n_chunks, err, size_a, size_b, size_full, ok ? "OK" : "FAIL");
             }
         }
     }
