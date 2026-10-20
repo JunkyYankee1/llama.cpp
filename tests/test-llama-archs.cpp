@@ -135,6 +135,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  -l, --layer-range        Check that a model split into two layer ranges matches the full model\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -884,6 +885,132 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+// archs whose graph supports llama_model_params.layer_start / layer_end
+static bool layer_range_supported(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_LLAMA:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::pair<llama_model_ptr, llama_context_ptr> get_model_part(
+        struct gguf_context * gguf_ctx, const size_t seed, const float stdev, const int32_t layer_start, const int32_t layer_end) {
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.layer_start = layer_start;
+    model_params.layer_end   = layer_end;
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 0;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.n_ubatch = 64;
+    if (layer_end > 0) {
+        ctx_params.embeddings   = true;
+        ctx_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
+
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create llama model part");
+    }
+    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+    if (!lctx) {
+        throw std::runtime_error("failed to create llama context for model part");
+    }
+    return std::make_pair(std::move(model), std::move(lctx));
+}
+
+// run the tokens through part A (tokens -> hidden states) and part B (hidden states -> logits) in n_chunks decode calls
+static std::vector<float> get_logits_split(
+        llama_context * ctx_a, llama_context * ctx_b, const std::vector<llama_token> & tokens, const int32_t n_embd, const int32_t n_vocab, const int n_chunks) {
+    std::vector<float> ret;
+    const int32_t n_tokens = tokens.size();
+    const int32_t n_chunk  = (n_tokens + n_chunks - 1) / n_chunks;
+
+    for (int32_t i0 = 0; i0 < n_tokens; i0 += n_chunk) {
+        const int32_t n = std::min(n_chunk, n_tokens - i0);
+
+        common_batch batch_a(ctx_a);
+        for (int32_t i = 0; i < n; i++) {
+            batch_a.add(tokens[i0 + i], i0 + i, 0, true);
+        }
+        if (llama_process(ctx_a, LLAMA_PROCESS_TYPE_DECODE, batch_a.get())) {
+            throw std::runtime_error("failed to decode part A");
+        }
+
+        llama_batch batch_b = llama_batch_init(n, n_embd, 1);
+        batch_b.n_tokens = n;
+        for (int32_t i = 0; i < n; i++) {
+            const float * hidden = llama_get_embeddings_ith(ctx_a, i);
+            if (hidden == nullptr) {
+                llama_batch_free(batch_b);
+                throw std::runtime_error("part A did not output hidden states");
+            }
+            memcpy(batch_b.embd + i*n_embd, hidden, n_embd*sizeof(float));
+            batch_b.pos[i]       = i0 + i;
+            batch_b.n_seq_id[i]  = 1;
+            batch_b.seq_id[i][0] = 0;
+            batch_b.logits[i]    = true;
+        }
+        const int32_t err = llama_process(ctx_b, LLAMA_PROCESS_TYPE_DECODE, batch_b);
+        llama_batch_free(batch_b);
+        if (err) {
+            throw std::runtime_error("failed to decode part B");
+        }
+
+        for (int32_t i = 0; i < n; i++) {
+            const float * logits_ith = llama_get_logits_ith(ctx_b, i);
+            ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+        }
+    }
+    return ret;
+}
+
+// split the model at every layer boundary and check that the two parts give the logits of the full model
+static int test_layer_range(const std::string & arch_filter, const size_t seed, const float stdev) {
+    const double nmse_thold = 1e-6;
+    int n_fail = 0;
+    int n_ok   = 0;
+
+    for (const llm_arch arch : llm_arch_all()) {
+        if (!arch_matches(arch_filter, arch) || !layer_range_supported(arch)) {
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, /*moe =*/ false);
+
+        auto [model_full, ctx_full] = get_model_part(gguf_ctx.get(), seed, stdev, 0, 0);
+        const int32_t n_layer = llama_model_n_layer(model_full.get());
+        const int32_t n_embd  = llama_model_n_embd(model_full.get());
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_full.get()));
+
+        const std::vector<llama_token> tokens = get_tokens(32, n_vocab, seed);
+        const std::vector<float> logits_full = get_logits(model_full.get(), ctx_full.get(), tokens);
+
+        for (int32_t split = 1; split < n_layer; split++) {
+            for (const int n_chunks : {1, 4}) {
+                auto [model_a, ctx_a] = get_model_part(gguf_ctx.get(), seed, stdev, 0, split);
+                auto [model_b, ctx_b] = get_model_part(gguf_ctx.get(), seed, stdev, split, 0);
+
+                const std::vector<float> logits_split = get_logits_split(ctx_a.get(), ctx_b.get(), tokens, n_embd, n_vocab, n_chunks);
+                const double err = nmse(logits_full, logits_split);
+                const bool ok = err <= nmse_thold;
+                n_ok   += ok;
+                n_fail += !ok;
+                LOG("%s: %-12s split at layer %d/%d, %d chunk(s): nmse = %.3e %s\n",
+                    __func__, llm_arch_name(arch), split, n_layer, n_chunks, err, ok ? "OK" : "FAIL");
+            }
+        }
+    }
+    LOG("%s: %d passed, %d failed\n", __func__, n_ok, n_fail);
+    return n_fail == 0 && n_ok > 0 ? 0 : 1;
+}
+
 static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -1242,6 +1369,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool layer_range = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1296,6 +1424,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--layer-range") == 0) {
+            layer_range = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -1324,6 +1454,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
+        }
+        if (layer_range) {
+            return test_layer_range(arch_filter, seed, stdev);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

@@ -352,6 +352,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
+        if (params.layer_start != 0 || params.layer_end > 0) {
+            const int32_t n_layer = model->hparams.n_layer();
+            const int32_t last    = params.layer_end > 0 ? params.layer_end : n_layer;
+            if (params.layer_start < 0 || params.layer_start >= last || last > n_layer) {
+                throw std::runtime_error(format("invalid layer range [%d, %d) for a model with %d layers", params.layer_start, last, n_layer));
+            }
+        }
         try {
             model->load_vocab(ml);
         } catch(const std::exception & e) {

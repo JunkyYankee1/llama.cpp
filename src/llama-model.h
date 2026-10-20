@@ -899,6 +899,9 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // [first, last) layers computed by this model instance, see llama_model_params.layer_start
+    std::pair<int32_t, int32_t> layer_range() const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

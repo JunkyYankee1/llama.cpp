@@ -333,6 +333,12 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // [EXPERIMENTAL] compute only the layers in [layer_start, layer_end), layer_end <= 0 means up to the last layer
+        // a part that does not start at layer 0 takes hidden states as input (llama_batch.embd)
+        // a part that does not end at the last layer outputs hidden states (llama_get_embeddings_ith), needs embeddings = true
+        int32_t layer_start;
+        int32_t layer_end;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 

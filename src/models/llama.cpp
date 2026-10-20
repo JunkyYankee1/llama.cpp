@@ -123,7 +123,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    const auto [il_first, il_last] = model.layer_range();
+
+    for (int il = il_first; il < il_last; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -227,6 +229,13 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         inpL = cur;
     }
     cur = inpL;
+
+    if (il_last < n_layer) {
+        // not the last part: output raw hidden states for the next part
+        cb(cur, "result_hidden", -1);
+        res->t_embd = cur;
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

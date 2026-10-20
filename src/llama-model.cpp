@@ -3316,6 +3316,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
+std::pair<int32_t, int32_t> llama_model::layer_range() const {
+    const int32_t n_layer = hparams.n_layer();
+    const int32_t first   = std::clamp(params.layer_start, 0, n_layer);
+    const int32_t last    = params.layer_end <= 0 ? n_layer : std::clamp(params.layer_end, first, n_layer);
+    return { first, last };
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
@@ -3353,6 +3360,8 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
+        /*.layer_start                 =*/ 0,
+        /*.layer_end                   =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
