@@ -10,6 +10,11 @@
 
 #include "protocol.h"
 
+#ifdef _WIN32
+#    include <windows.h>
+#    include <shellapi.h>
+#endif
+
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -953,7 +958,42 @@ static void usage() {
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
 }
 
+#ifdef _WIN32
+// argv comes in the ANSI code page: take the command line as UTF-16 and convert it to UTF-8
+// so that non-ASCII paths and prompts survive, as common_params_parse does
+static std::vector<std::string> utf8_args() {
+    std::vector<std::string> out;
+    int wargc = 0;
+    LPWSTR * wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == nullptr) {
+        return out;
+    }
+    for (int i = 0; i < wargc; i++) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string a(n > 0 ? n - 1 : 0, '\0');
+        if (n > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, a.data(), n, nullptr, nullptr);
+        }
+        out.push_back(std::move(a));
+    }
+    LocalFree(wargv);
+    return out;
+}
+#endif
+
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    std::vector<std::string> args_utf8 = utf8_args();
+    std::vector<char *>      argv_utf8;
+    if ((int) args_utf8.size() == argc) {
+        for (auto & s : args_utf8) {
+            argv_utf8.push_back(s.data());
+        }
+        argv_utf8.push_back(nullptr);
+        argv = argv_utf8.data();
+    }
+#endif
     if (argc < 2) {
         usage();
         return 2;
