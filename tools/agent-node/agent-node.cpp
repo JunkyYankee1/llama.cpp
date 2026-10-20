@@ -13,6 +13,7 @@
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "llama-cpp.h"
 #include "llama.h"
 
@@ -915,6 +916,30 @@ static int cmd_compare(const cli_args & a) {
     return tokens_ok && logits_ok ? 0 : 1;
 }
 
+// prints the shape of the model as one JSON line, for the scripts that split it into layer ranges
+// reads only the GGUF metadata, no weights
+static int cmd_info(const cli_args & a) {
+    const std::string path = a.get("-m", "--model", "");
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        throw std::runtime_error("cannot read the GGUF metadata of " + path);
+    }
+    auto get_str = [&](const std::string & key) -> std::string {
+        const int64_t id = gguf_find_key(g, key.c_str());
+        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id) : "";
+    };
+    auto get_u32 = [&](const std::string & key) -> long long {
+        const int64_t id = gguf_find_key(g, key.c_str());
+        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? (long long) gguf_get_val_u32(g, id) : -1;
+    };
+    const std::string arch = get_str("general.architecture");
+    printf("{\"arch\":\"%s\",\"n_layer\":%lld,\"n_embd\":%lld,\"full_attention_interval\":%lld}\n", arch.c_str(),
+        get_u32(arch + ".block_count"), get_u32(arch + ".embedding_length"), get_u32(arch + ".full_attention_interval"));
+    gguf_free(g);
+    return 0;
+}
+
 static void usage() {
     fprintf(stderr,
         "usage:\n"
@@ -923,6 +948,7 @@ static void usage() {
         "                       [--top 8] [--ignore-eos] [--no-chat] [--dump FILE] [--json FILE]\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.01]\n"
+        "  agent-node info      -m model.gguf\n"
         "\n"
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
 }
@@ -937,6 +963,9 @@ int main(int argc, char ** argv) {
         cli_args a(argc, argv, 2);
         if (cmd == "compare") {
             return cmd_compare(a);
+        }
+        if (cmd == "info") {
+            return cmd_info(a);
         }
 
         llama_log_set(log_callback, nullptr);
