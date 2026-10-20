@@ -69,6 +69,7 @@ static bool can_reuse_kq_mask(
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
+        GGML_ASSERT(tokens && "this part of the model takes hidden states, not tokens");
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -2583,6 +2584,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     assert(n_embd_inp >= n_embd);
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+
+    // a part of the model that does not start at layer 0 has no token embeddings and takes hidden states only
+    if (tok_embd == nullptr) {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+        cb(inp->embd, "inp_embd", -1);
+        ggml_set_input(inp->embd);
+
+        ggml_tensor * cur = inp->embd;
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, ubatch.n_tokens, cur->nb[1], 0);
+        }
+        res->t_inp_embd = cur;
+        cb(cur, "embd", -1);
+
+        res->add_input(std::move(inp));
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it

@@ -2381,6 +2381,15 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         if (!has_layer(tn.bid)) {
             flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
         }
+    } else {
+        // the token embeddings are only used by the first part, the output head only by the last part
+        const auto [first, last] = layer_range();
+        const bool is_output = tn.tensor == LLM_TENSOR_OUTPUT || tn.tensor == LLM_TENSOR_OUTPUT_NORM ||
+            (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED));
+        const bool is_input  = tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED);
+        if ((is_input && first > 0) || (is_output && last < (int32_t) hparams.n_layer())) {
+            flags |= TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        }
     }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,

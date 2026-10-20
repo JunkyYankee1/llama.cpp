@@ -358,6 +358,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             if (params.layer_start < 0 || params.layer_start >= last || last > n_layer) {
                 throw std::runtime_error(format("invalid layer range [%d, %d) for a model with %d layers", params.layer_start, last, n_layer));
             }
+            // the graph builders of other architectures ignore the layer range
+            switch (model->arch) {
+                case LLM_ARCH_LLAMA:
+                case LLM_ARCH_QWEN35:
+                case LLM_ARCH_QWEN35MOE:
+                    break;
+                default:
+                    throw std::runtime_error(format("layer range is not supported for architecture %s", llm_arch_name(model->arch)));
+            }
         }
         try {
             model->load_vocab(ml);
