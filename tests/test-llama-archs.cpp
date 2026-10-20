@@ -198,6 +198,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head  = 8;
         n_ff    = 1024;
         n_layer = 4;
+    } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+        n_layer = 4; // 3 recurrent layers + 1 full attention layer, as in the real models
     } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
@@ -992,7 +994,7 @@ static int test_layer_range(const std::string & arch_filter, const size_t seed, 
         }
         gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch));
         if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
-            // 2 layers: recurrent then full attention, so each part holds one kind of layer
+            // 4 layers: recurrent and full attention in turn, so the splits cut both kinds of layers
             gguf_set_val_u32(gguf_ctx.get(), (std::string(llm_arch_name(arch)) + ".full_attention_interval").c_str(), 2);
         }
 

@@ -1706,6 +1706,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         layers.resize(n_layer_all);
 
+        // the weights outside the layer range stay on disk
+        if (const auto [first, last] = layer_range(); first > 0 || last < (int32_t) hparams.n_layer()) {
+            const bool tied = ml.get_weight("output.weight") == nullptr; // the output head reuses token_embd
+            const bool has_output = last == (int32_t) hparams.n_layer();
+            ml.skip_weights([&](const std::string & name) {
+                int il = -1;
+                if (sscanf(name.c_str(), "blk.%d.", &il) == 1) {
+                    return !has_layer(il);
+                }
+                if (name.rfind("token_embd.", 0) == 0) {
+                    return first > 0 && !(has_output && tied);
+                }
+                if (name.rfind("output.", 0) == 0 || name.rfind("output_norm.", 0) == 0) {
+                    return !has_output;
+                }
+                return false;
+            });
+        }
+
         // call the per-model loading function
         load_arch_tensors(ml);
 

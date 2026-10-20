@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -237,6 +238,11 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // tensors of the files that the model does not use (e.g. outside the layer range): they count as created
+    // and create_tensor returns null for them, so the weights are neither allocated nor read
+    void skip_weights(const std::function<bool(const std::string & name)> & pred);
+    std::set<std::string> skipped;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

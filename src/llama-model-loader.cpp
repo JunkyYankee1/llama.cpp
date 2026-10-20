@@ -1117,6 +1117,10 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    if (!skipped.empty() && skipped.count(tn.str())) {
+        return nullptr;
+    }
+
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
@@ -1180,8 +1184,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            // a model without files counts no tensors
-            if (!files.empty()) {
+            // a model without files counts no tensors, a duplicated tensor was counted as the original
+            if (!files.empty() && !(flags & TENSOR_DUPLICATED)) {
                 size_data -= nbytes;
                 n_created++;
             }
@@ -1394,6 +1398,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+void llama_model_loader::skip_weights(const std::function<bool(const std::string & name)> & pred) {
+    size_t n_bytes = 0;
+    for (const auto & [name, w] : weights_map) {
+        if (pred(name) && skipped.insert(name).second) {
+            n_created++;
+            size_data -= ggml_nbytes(w.tensor);
+            n_bytes   += ggml_nbytes(w.tensor);
+        }
+    }
+    LLAMA_LOG_INFO("%s: skipping %zu tensors (%.2f MiB) outside of the layer range\n", __func__, skipped.size(), n_bytes/1024.0/1024.0);
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
