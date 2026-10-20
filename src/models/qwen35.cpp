@@ -211,6 +211,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     if (il_last < n_layer) {
         // not the last part: output raw hidden states for the next part
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
         cb(cur, "result_hidden", -1);
         res->t_embd = cur;
         return;

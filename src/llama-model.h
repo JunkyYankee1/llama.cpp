@@ -902,6 +902,9 @@ struct llama_model {
     // [first, last) layers computed by this model instance, see llama_model_params.layer_start
     std::pair<int32_t, int32_t> layer_range() const;
 
+    // false for a trunk layer outside layer_range(): no weights, no KV or recurrent state
+    bool has_layer(int32_t il) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

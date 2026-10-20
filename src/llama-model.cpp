@@ -3323,6 +3323,11 @@ std::pair<int32_t, int32_t> llama_model::layer_range() const {
     return { first, last };
 }
 
+bool llama_model::has_layer(int32_t il) const {
+    const auto [first, last] = layer_range();
+    return il >= (int32_t) hparams.n_layer() || (il >= first && il < last);
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 

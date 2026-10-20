@@ -944,23 +944,24 @@ static std::vector<float> get_logits_split(
             throw std::runtime_error("failed to decode part A");
         }
 
-        llama_batch batch_b = llama_batch_init(n, n_embd, 1);
-        batch_b.n_tokens = n;
+        // copy the hidden states: the batch keeps non-owning views
+        std::vector<float> hidden(n*n_embd);
         for (int32_t i = 0; i < n; i++) {
-            const float * hidden = llama_get_embeddings_ith(ctx_a, i);
-            if (hidden == nullptr) {
-                llama_batch_free(batch_b);
+            const float * hidden_ith = llama_get_embeddings_ith(ctx_a, i);
+            if (hidden_ith == nullptr) {
                 throw std::runtime_error("part A did not output hidden states");
             }
-            memcpy(batch_b.embd + i*n_embd, hidden, n_embd*sizeof(float));
-            batch_b.pos[i]       = i0 + i;
-            batch_b.n_seq_id[i]  = 1;
-            batch_b.seq_id[i][0] = 0;
-            batch_b.logits[i]    = true;
+            memcpy(hidden.data() + i*n_embd, hidden_ith, n_embd*sizeof(float));
         }
-        const int32_t err = llama_process(ctx_b, LLAMA_PROCESS_TYPE_DECODE, batch_b);
-        llama_batch_free(batch_b);
-        if (err) {
+
+        common_batch batch_b(ctx_b);
+        for (int32_t i = 0; i < n; i++) {
+            // text positions, for M-RoPE they expand to [p, p, p, 0]
+            const llama_pos p = i0 + i;
+            const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
+            batch_b.add_embd({ hidden.data() + i*n_embd, 1, (size_t) n_embd }, pos, 0, true);
+        }
+        if (llama_process(ctx_b, LLAMA_PROCESS_TYPE_DECODE, batch_b.get())) {
             throw std::runtime_error("failed to decode part B");
         }
 
@@ -982,7 +983,11 @@ static int test_layer_range(const std::string & arch_filter, const size_t seed, 
         if (!arch_matches(arch_filter, arch) || !layer_range_supported(arch)) {
             continue;
         }
-        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, /*moe =*/ false);
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch));
+        if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+            // 2 layers: recurrent then full attention, so each part holds one kind of layer
+            gguf_set_val_u32(gguf_ctx.get(), (std::string(llm_arch_name(arch)) + ".full_attention_interval").c_str(), 2);
+        }
 
         auto [model_full, ctx_full] = get_model_part(gguf_ctx.get(), seed, stdev, 0, 0);
         const int32_t n_layer = llama_model_n_layer(model_full.get());

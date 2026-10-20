@@ -173,6 +173,11 @@ llama_kv_cache::llama_kv_cache(
             continue;
         }
 
+        if (!model.has_layer(il)) {
+            LLAMA_LOG_DEBUG("%s: layer %3d: outside of the layer range\n", __func__, il);
+            continue;
+        }
+
         if (share && other) {
             const int32_t il_share = share(il);
 

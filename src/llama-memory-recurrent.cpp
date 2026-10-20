@@ -80,6 +80,11 @@ llama_memory_recurrent::llama_memory_recurrent(
             continue;
         }
 
+        if (!model.has_layer(i)) {
+            LLAMA_LOG_DEBUG("%s: layer %3d: outside of the layer range\n", __func__, i);
+            continue;
+        }
+
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
