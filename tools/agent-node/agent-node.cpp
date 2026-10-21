@@ -28,6 +28,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -99,8 +100,27 @@ struct cli_args {
     }
 };
 
+// file paths are UTF-8; on Windows fopen and the narrow fstream constructors take the ANSI code page,
+// so paths with non-ASCII characters (e.g. a Cyrillic user folder) go through the wide-char API
+static std::filesystem::path u8_path(const std::string & path) {
+#if defined(__cpp_char8_t)
+    return std::filesystem::path(std::u8string(path.begin(), path.end()));
+#else
+    return std::filesystem::u8path(path);
+#endif
+}
+
+static FILE * fopen_utf8(const std::string & path, const char * mode) {
+#ifdef _WIN32
+    const std::wstring wmode(mode, mode + strlen(mode));
+    return _wfopen(u8_path(path).c_str(), wmode.c_str());
+#else
+    return fopen(path.c_str(), mode);
+#endif
+}
+
 static std::string read_file(const std::string & path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(u8_path(path), std::ios::binary);
     if (!f) {
         throw std::runtime_error("cannot open " + path);
     }
@@ -715,7 +735,7 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
     }
     FILE * dump = nullptr;
     if (!g.dump.empty()) {
-        dump = fopen(g.dump.c_str(), "w");
+        dump = fopen_utf8(g.dump, "w");
         if (!dump) {
             throw std::runtime_error("cannot write " + g.dump);
         }
@@ -824,7 +844,7 @@ static int cmd_client(const cli_args & a) {
     }
 
     if (!g.json.empty()) {
-        std::ofstream f(g.json);
+        std::ofstream f(u8_path(g.json));
         f << "{\"n_nodes\":" << addrs.size() << ",\"n_embd\":" << chain.parts[0].n_embd << ",\"n_prompt\":" << r.n_prompt
           << ",\"prefill_ms\":" << r.prefill_ms << ",\"n_gen\":" << r.n_gen_eval << ",\"gen_ms\":" << r.gen_ms
           << ",\"tg_tok_s\":" << (r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0)
@@ -858,7 +878,7 @@ struct dump_step {
 };
 
 static std::vector<dump_step> read_dump(const std::string & path) {
-    std::ifstream f(path);
+    std::ifstream f(u8_path(path));
     if (!f) {
         throw std::runtime_error("cannot open " + path);
     }
