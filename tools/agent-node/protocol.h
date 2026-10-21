@@ -34,7 +34,17 @@ enum class msg : uint8_t {
 enum class payload : uint8_t {
     tokens = 0, // int32 token ids
     f16    = 1, // fp16 hidden states, n_tokens rows of n_embd
+    f32    = 2, // fp32 hidden states: exact, twice the traffic, for checks
 };
+
+inline size_t payload_size(payload kind, uint32_t n_tokens, int32_t n_embd) {
+    switch (kind) {
+        case payload::tokens: return (size_t) n_tokens * 4;
+        case payload::f16:    return (size_t) n_tokens * n_embd * 2;
+        case payload::f32:    return (size_t) n_tokens * n_embd * 4;
+    }
+    throw std::runtime_error("unknown payload kind " + std::to_string((int) kind));
+}
 
 enum forward_flags : uint8_t {
     FORWARD_OUT_ALL = 1, // the last node returns logits for every token, not only the last one
@@ -153,10 +163,11 @@ struct open_msg {
     uint32_t    n_ctx   = 4096;
     uint32_t    n_top   = 8;  // logits per output position returned by the last node
     std::string next;         // address of the next node, empty: this is the last node, results go back to the client
+    payload     hidden  = payload::f16; // how the nodes of this session pass hidden states (optional field)
 
     writer write() const {
         writer w;
-        w.put(version).put(session).put(n_ctx).put(n_top).put_str(next);
+        w.put(version).put(session).put(n_ctx).put(n_top).put_str(next).put((uint8_t) hidden);
         return w;
     }
     static open_msg read(reader & r) {
@@ -166,6 +177,9 @@ struct open_msg {
         m.n_ctx   = r.get<uint32_t>();
         m.n_top   = r.get<uint32_t>();
         m.next    = r.get_str();
+        if (r.left() >= 1) {
+            m.hidden = (payload) r.get<uint8_t>();
+        }
         return m;
     }
 };

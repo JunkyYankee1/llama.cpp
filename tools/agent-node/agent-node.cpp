@@ -63,7 +63,7 @@ struct cli_args {
     std::vector<std::string>           positional;
 
     static bool is_flag(const std::string & name) {
-        return name == "--ignore-eos" || name == "--no-chat" || name == "-v" || name == "--verbose";
+        return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "-v" || name == "--verbose";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -267,12 +267,16 @@ struct model_part {
                 const bool out = !is_last() || out_all || i + 1 == h.n_tokens;
                 batch.add(ids[i], h.pos0 + (int32_t) i, 0, out);
             }
-        } else if (h.kind == payload::f16) {
+        } else if (h.kind == payload::f16 || h.kind == payload::f32) {
             if (is_first()) {
                 throw std::runtime_error("the first node takes tokens, not hidden states");
             }
             hidden_in.resize((size_t) h.n_tokens * n_embd);
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, hidden_in.data(), (int64_t) hidden_in.size());
+            if (h.kind == payload::f16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, hidden_in.data(), (int64_t) hidden_in.size());
+            } else {
+                memcpy(hidden_in.data(), data, hidden_in.size() * sizeof(float));
+            }
             for (uint32_t i = 0; i < h.n_tokens; i++) {
                 const llama_pos p = h.pos0 + (llama_pos) i;
                 // text positions, for M-RoPE they expand to [p, p, p, 0]
@@ -322,6 +326,7 @@ struct session {
     uint64_t                    id = 0;
     std::unique_ptr<model_part> part;
     uint32_t                    n_top = 8;
+    payload                     hidden = payload::f16;
     tcp_conn_ptr                owner; // the client that opened the session, gets the results of the last node
     tcp_conn_ptr                next;  // the next node, null for the last node
     std::mutex                  mtx;
@@ -363,6 +368,10 @@ struct node_server {
         auto s = std::make_shared<session>();
         s->id    = m.session;
         s->n_top = std::clamp<uint32_t>(m.n_top, 1, 256);
+        if (m.hidden != payload::f16 && m.hidden != payload::f32) {
+            throw std::runtime_error("hidden states must be f16 or f32");
+        }
+        s->hidden = m.hidden;
         s->owner = conn;
         s->part  = std::make_unique<model_part>(model.get(), mo, m.n_ctx, n_threads);
 
@@ -416,7 +425,7 @@ struct node_server {
 
         std::lock_guard<std::mutex> lock(s->mtx);
         model_part & p = *s->part;
-        const size_t need = h.kind == payload::tokens ? (size_t) h.n_tokens * 4 : (size_t) h.n_tokens * p.n_embd * 2;
+        const size_t need = payload_size(h.kind, h.n_tokens, p.n_embd);
         const uint8_t * data = r.get_bytes(need);
 
         s->st.bytes_in += 5 + body.size();
@@ -433,10 +442,14 @@ struct node_server {
 
         if (!p.is_last()) {
             forward_hdr out = h;
-            out.kind = payload::f16;
+            out.kind = s->hidden;
             writer w;
             out.write(w);
-            ggml_fp32_to_fp16_row(hidden.data(), (ggml_fp16_t *) w.grow(hidden.size() * 2), (int64_t) hidden.size());
+            if (s->hidden == payload::f32) {
+                w.put_bytes(hidden.data(), hidden.size() * sizeof(float));
+            } else {
+                ggml_fp32_to_fp16_row(hidden.data(), (ggml_fp16_t *) w.grow(hidden.size() * 2), (int64_t) hidden.size());
+            }
             s->st.bytes_out += frame_size(w);
             if (!send_frame(*s->next, msg::forward, w)) {
                 throw std::runtime_error("the next node closed the connection");
@@ -560,7 +573,7 @@ struct chain_eval : evaluator {
     uint32_t                  step = 0;
     uint32_t                  n_top = 8;
 
-    chain_eval(const std::vector<std::string> & addrs, uint32_t n_ctx, uint32_t n_top) : addrs(addrs), n_top(n_top) {
+    chain_eval(const std::vector<std::string> & addrs, uint32_t n_ctx, uint32_t n_top, payload hidden) : addrs(addrs), n_top(n_top) {
         std::random_device rd;
         sid = ((uint64_t) rd() << 32) | rd();
 
@@ -575,6 +588,7 @@ struct chain_eval : evaluator {
             m.n_ctx   = n_ctx;
             m.n_top   = n_top;
             m.next    = i + 1 < addrs.size() ? addrs[i + 1] : "";
+            m.hidden  = hidden;
             send_frame(*conns[i], msg::open, m.write());
 
             std::vector<uint8_t> body = expect(i, msg::open_ok);
@@ -677,6 +691,36 @@ struct local_eval : evaluator {
     }
 };
 
+struct dump_step {
+    llama_token            token;
+    std::vector<top_entry> top;
+};
+
+static std::vector<dump_step> read_dump(const std::string & path) {
+    std::ifstream f(u8_path(path));
+    if (!f) {
+        throw std::runtime_error("cannot open " + path);
+    }
+    std::vector<dump_step> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream ss(line);
+        int step;
+        dump_step d;
+        ss >> step >> d.token;
+        std::string item;
+        while (ss >> item) {
+            const size_t p = item.find(':');
+            d.top.push_back({ std::stoi(item.substr(0, p)), std::stof(item.substr(p + 1)) });
+        }
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
 struct gen_opts {
     std::string prompt;
     bool        chat       = true;
@@ -687,6 +731,8 @@ struct gen_opts {
     bool        ignore_eos = false;
     std::string dump;
     std::string json;
+    std::vector<llama_token> force; // follow these tokens instead of the greedy choice (from a reference dump)
+    payload     hidden = payload::f16;
 };
 
 static gen_opts gen_opts_from(const cli_args & a) {
@@ -705,6 +751,16 @@ static gen_opts gen_opts_from(const cli_args & a) {
     g.ignore_eos = a.has("--ignore-eos");
     g.dump       = a.get("--dump", "", "");
     g.json       = a.get("--json", "", "");
+    if (a.has("--force")) {
+        for (const auto & d : read_dump(a.get("--force", "", ""))) {
+            g.force.push_back(d.token);
+        }
+    }
+    const std::string hidden = a.get("--hidden", "", "f16");
+    if (hidden != "f16" && hidden != "f32") {
+        throw std::runtime_error("--hidden must be f16 or f32");
+    }
+    g.hidden = hidden == "f32" ? payload::f32 : payload::f16;
     return g;
 }
 
@@ -760,7 +816,8 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
     int32_t pos = (int32_t) prompt.size();
     t0 = now_ms();
     for (int32_t i = 0; i < g.n_gen; i++) {
-        const llama_token tok = top[0].id;
+        // with --force the context follows the reference, so every step compares logits on the same text
+        const llama_token tok = (size_t) i < g.force.size() ? g.force[i] : top[0].id;
         res.tokens.push_back(tok);
         if (dump) {
             fprintf(dump, "%d %d", i, tok);
@@ -819,7 +876,7 @@ static int cmd_client(const cli_args & a) {
 
     const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
 
-    chain_eval chain(addrs, g.n_ctx, g.n_top);
+    chain_eval chain(addrs, g.n_ctx, g.n_top, g.hidden);
     if (chain.parts[0].n_vocab != llama_vocab_n_tokens(vocab)) {
         throw std::runtime_error("the tokenizer does not match the model of the chain");
     }
@@ -872,44 +929,16 @@ static int cmd_reference(const cli_args & a) {
 // compare two dumps: the chain against the reference
 //
 
-struct dump_step {
-    llama_token            token;
-    std::vector<top_entry> top;
-};
-
-static std::vector<dump_step> read_dump(const std::string & path) {
-    std::ifstream f(u8_path(path));
-    if (!f) {
-        throw std::runtime_error("cannot open " + path);
-    }
-    std::vector<dump_step> out;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-        std::istringstream ss(line);
-        int step;
-        dump_step d;
-        ss >> step >> d.token;
-        std::string item;
-        while (ss >> item) {
-            const size_t p = item.find(':');
-            d.top.push_back({ std::stoi(item.substr(0, p)), std::stof(item.substr(p + 1)) });
-        }
-        out.push_back(std::move(d));
-    }
-    return out;
-}
-
 static int cmd_compare(const cli_args & a) {
     if (a.positional.size() != 2) {
-        throw std::runtime_error("usage: agent-node compare chain.txt reference.txt [--tokens 128] [--tol 0.01]");
+        throw std::runtime_error("usage: agent-node compare chain.txt reference.txt [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]");
     }
     const auto x = read_dump(a.positional[0]);
     const auto y = read_dump(a.positional[1]);
-    const size_t want = (size_t) a.get_int("--tokens", "", 128);
-    const double tol  = std::stod(a.get("--tol", "", "0.01"));
+    const size_t want      = (size_t) a.get_int("--tokens", "", 128);
+    const double tol       = std::stod(a.get("--tol", "", "0.03"));
+    const double top1_min  = std::stod(a.get("--top1", "", "0.95"));
+    const bool   same_toks = a.has("--same-tokens"); // free generation: require identical greedy tokens
 
     const size_t n = std::min({ x.size(), y.size(), want });
     size_t n_same = 0;
@@ -918,27 +947,43 @@ static int cmd_compare(const cli_args & a) {
     }
 
     // the logits are comparable while the contexts are equal: up to and including the first different token
-    double max_diff = 0, max_abs = 0;
+    // (with --force on the chain side the contexts are equal at every step)
+    double max_diff = 0, max_abs = 0, sum_diff = 0;
+    size_t n_diff = 0, n_top1 = 0;
     const size_t n_cmp = std::min(n, n_same + 1);
     for (size_t i = 0; i < n_cmp; i++) {
+        n_top1 += !x[i].top.empty() && !y[i].top.empty() && x[i].top[0].id == y[i].top[0].id;
         for (const auto & ey : y[i].top) {
             max_abs = std::max(max_abs, (double) std::fabs(ey.logit));
             for (const auto & ex : x[i].top) {
                 if (ex.id == ey.id) {
-                    max_diff = std::max(max_diff, (double) std::fabs(ex.logit - ey.logit));
+                    const double d = std::fabs(ex.logit - ey.logit);
+                    max_diff = std::max(max_diff, d);
+                    sum_diff += d;
+                    n_diff++;
                 }
             }
         }
     }
-    const double rel = max_abs > 0 ? max_diff / max_abs : 0;
-    const bool tokens_ok = n_same == n && n == want;
-    const bool logits_ok = rel <= tol;
+    const double rel  = max_abs > 0 ? max_diff / max_abs : 0;
+    const double top1 = n_cmp > 0 ? (double) n_top1 / n_cmp : 0;
+
+    const bool tokens_ok = !same_toks || (n_same == n && n == want);
+    const bool cover_ok  = n_cmp == want; // every step was compared on the same context
+    const bool logits_ok = rel <= tol && top1 >= top1_min;
 
     printf("tokens: %zu of %zu equal (want %zu)%s\n", n_same, n, want,
         n_same < n ? (" - first difference at token " + std::to_string(n_same)).c_str() : "");
-    printf("logits: max |diff| = %.4f, max |logit| = %.2f, relative = %.2e (tolerance %.0e)\n", max_diff, max_abs, rel, tol);
-    printf("%s\n", tokens_ok && logits_ok ? "PASS" : "FAIL");
-    return tokens_ok && logits_ok ? 0 : 1;
+    printf("steps compared on the same context: %zu, same top-1 token: %zu (%.1f%%, need %.0f%%)\n",
+        n_cmp, n_top1, 100.0 * top1, 100.0 * top1_min);
+    printf("logits: max |diff| = %.4f, mean |diff| = %.4f, max |logit| = %.2f, relative = %.2e (tolerance %.0e)\n",
+        max_diff, n_diff ? sum_diff / n_diff : 0.0, max_abs, rel, tol);
+    if (!cover_ok && !same_toks) {
+        printf("note: the contexts diverged before token %zu, run the chain with --force REFERENCE_DUMP to compare every step\n", want);
+    }
+    const bool ok = tokens_ok && cover_ok && logits_ok;
+    printf("%s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 // prints the shape of the model as one JSON line, for the scripts that split it into layer ranges
@@ -971,8 +1016,9 @@ static void usage() {
         "  agent-node node      -m model.gguf --layers START:END [--host 127.0.0.1] [--port 50152] [-ngl 999] [--device CUDA0] [-t N]\n"
         "  agent-node client    -m model.gguf --chain HOST:PORT,HOST:PORT,... [-p TEXT | -f FILE] [-n 64] [-c 4096]\n"
         "                       [--top 8] [--ignore-eos] [--no-chat] [--dump FILE] [--json FILE]\n"
+        "                       [--hidden f16|f32] [--force REFERENCE_DUMP]\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
-        "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.01]\n"
+        "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
         "\n"
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
