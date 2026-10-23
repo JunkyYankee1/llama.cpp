@@ -91,7 +91,8 @@ struct cli_args {
             "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
-        for (const auto & [name, value] : opts) {
+        for (const auto & kv : opts) {
+            const std::string & name = kv.first;
             if (std::find_if(std::begin(known), std::end(known), [&](const char * k) { return name == k; }) == std::end(known)) {
                 throw std::runtime_error("unknown option " + name);
             }
