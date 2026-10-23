@@ -164,10 +164,11 @@ struct open_msg {
     uint32_t    n_top   = 8;  // logits per output position returned by the last node
     std::string next;         // address of the next node, empty: this is the last node, results go back to the client
     payload     hidden  = payload::f16; // how the nodes of this session pass hidden states (optional field)
+    uint32_t    n_rollback = 0;         // how many trailing tokens of a forward may be rolled back (speculative decoding, optional field)
 
     writer write() const {
         writer w;
-        w.put(version).put(session).put(n_ctx).put(n_top).put_str(next).put((uint8_t) hidden);
+        w.put(version).put(session).put(n_ctx).put(n_top).put_str(next).put((uint8_t) hidden).put(n_rollback);
         return w;
     }
     static open_msg read(reader & r) {
@@ -179,6 +180,9 @@ struct open_msg {
         m.next    = r.get_str();
         if (r.left() >= 1) {
             m.hidden = (payload) r.get<uint8_t>();
+        }
+        if (r.left() >= 4) {
+            m.n_rollback = r.get<uint32_t>();
         }
         return m;
     }
@@ -213,7 +217,8 @@ struct open_ok_msg {
 struct forward_hdr {
     uint64_t session  = 0;
     uint32_t step     = 0;  // incremented by the client for every forward
-    int32_t  pos0     = 0;  // position of the first token, the following tokens are consecutive
+    int32_t  pos0     = 0;  // position of the first token, the following tokens are consecutive;
+                            // pos0 before the end of the previous forward rolls the rejected draft tokens back
     uint32_t n_tokens = 0;
     payload  kind     = payload::tokens;
     uint8_t  flags    = 0;

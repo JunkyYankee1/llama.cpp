@@ -27,6 +27,19 @@ agent-node reference -m model.gguf -p "Hello" -n 128 --ignore-eos --dump ref.txt
 agent-node compare chain.txt ref.txt --tokens 128
 ```
 
+Speculative decoding: a small draft model of the same family on the client proposes `--draft-max` tokens, one pass
+over the chain checks them all, the longest matching prefix is accepted plus the next token of the chain. The text
+is the greedy text of the chain alone; the cost of the network is paid once per pass instead of once per token.
+
+```sh
+agent-node client -m model.gguf --chain ... --draft draft.gguf --draft-max 6
+```
+
+The nodes undo rejected draft tokens by themselves: a forward that starts before the end of the previous one rolls
+the memory back (`llama_memory_seq_rm`; the recurrent layers keep `n_rs_seq` snapshots, set from `n_rollback` of
+`open`). The draft model saves its recurrent state before every draft (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`) and
+restores it after the check.
+
 `--json` writes the speed of the prompt and of the generation and, for every node, the bytes in and out and the
 compute time per generated token.
 
@@ -49,6 +62,6 @@ The client opens the session from the last node to the first one, so that every 
 already open session of its next node. The client checks that the layer ranges cover the model without gaps.
 
 Not done yet (see the transport spec of the agent repository): TLS and coordinator tokens, failover with replay
-of the forward history, speculative decoding with state checkpoints, int8 hidden states.
+of the forward history, int8 hidden states.
 
 Supported architectures: those with layer range support (llama, qwen35, qwen35moe).

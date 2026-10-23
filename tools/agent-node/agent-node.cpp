@@ -217,10 +217,12 @@ struct model_part {
     llama_context_ptr   ctx;
     int32_t first = 0, last = 0, n_layer = 0, n_embd = 0, n_vocab = 0;
     int32_t n_batch = 512;
+    int32_t n_past  = 0; // tokens in the memory: the next forward continues at this position
 
     std::vector<float> hidden_in;
 
-    model_part(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads) : model(model) {
+    // n_rollback: how many trailing tokens of a forward can be rolled back (speculative decoding)
+    model_part(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_rollback = 0) : model(model) {
         n_layer = llama_model_n_layer(model);
         n_embd  = llama_model_n_embd(model);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -232,6 +234,8 @@ struct model_part {
         cp.n_batch         = n_batch;
         cp.n_ubatch        = n_batch;
         cp.n_seq_max       = 1;
+        // recurrent layers (Gated DeltaNet) keep snapshots of their state to undo rejected draft tokens
+        cp.n_rs_seq        = n_rollback;
         cp.n_threads       = n_threads;
         cp.n_threads_batch = n_threads;
         cp.no_perf         = true;
@@ -256,6 +260,18 @@ struct model_part {
             throw std::runtime_error("forward must carry 1.." + std::to_string(n_batch) + " tokens");
         }
         const bool out_all = h.flags & FORWARD_OUT_ALL;
+
+        // a forward that starts before the end of the previous one drops the rejected draft tokens
+        if (h.pos0 > n_past) {
+            throw std::runtime_error("forward at position " + std::to_string(h.pos0) + " leaves a gap after " + std::to_string(n_past));
+        }
+        if (h.pos0 < n_past) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, h.pos0, -1)) {
+                throw std::runtime_error("cannot roll back from " + std::to_string(n_past) + " to " + std::to_string(h.pos0) +
+                    " (at most n_rollback tokens of the last forward)");
+            }
+            n_past = h.pos0;
+        }
 
         common_batch batch(ctx.get());
         if (h.kind == payload::tokens) {
@@ -291,6 +307,7 @@ struct model_part {
         if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
             throw std::runtime_error("llama_process failed at position " + std::to_string(h.pos0));
         }
+        n_past = h.pos0 + (int32_t) h.n_tokens;
 
         if (!is_last()) {
             hidden_out.resize((size_t) h.n_tokens * n_embd);
@@ -373,7 +390,7 @@ struct node_server {
         }
         s->hidden = m.hidden;
         s->owner = conn;
-        s->part  = std::make_unique<model_part>(model.get(), mo, m.n_ctx, n_threads);
+        s->part  = std::make_unique<model_part>(model.get(), mo, m.n_ctx, n_threads, std::min<uint32_t>(m.n_rollback, 32));
 
         if (s->part->is_last() != m.next.empty()) {
             throw std::runtime_error(s->part->is_last() ? "this node runs the last layers, it has no next node"
@@ -561,8 +578,8 @@ static int cmd_node(const cli_args & a) {
 
 struct evaluator {
     virtual ~evaluator() = default;
-    // runs n tokens from position pos0, returns the top-k of the last token
-    virtual std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0) = 0;
+    // runs n tokens from position pos0, returns the top-k of the last token, or of every token with out_all
+    virtual std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) = 0;
 };
 
 struct chain_eval : evaluator {
@@ -573,7 +590,8 @@ struct chain_eval : evaluator {
     uint32_t                  step = 0;
     uint32_t                  n_top = 8;
 
-    chain_eval(const std::vector<std::string> & addrs, uint32_t n_ctx, uint32_t n_top, payload hidden) : addrs(addrs), n_top(n_top) {
+    chain_eval(const std::vector<std::string> & addrs, uint32_t n_ctx, uint32_t n_top, payload hidden, uint32_t n_rollback = 0)
+        : addrs(addrs), n_top(n_top) {
         std::random_device rd;
         sid = ((uint64_t) rd() << 32) | rd();
 
@@ -589,6 +607,7 @@ struct chain_eval : evaluator {
             m.n_top   = n_top;
             m.next    = i + 1 < addrs.size() ? addrs[i + 1] : "";
             m.hidden  = hidden;
+            m.n_rollback = n_rollback;
             send_frame(*conns[i], msg::open, m.write());
 
             std::vector<uint8_t> body = expect(i, msg::open_ok);
@@ -634,13 +653,14 @@ struct chain_eval : evaluator {
         return body;
     }
 
-    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0) override {
+    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) override {
         forward_hdr h;
         h.session  = sid;
         h.step     = ++step;
         h.pos0     = pos0;
         h.n_tokens = n;
         h.kind     = payload::tokens;
+        h.flags    = out_all ? FORWARD_OUT_ALL : 0;
         writer w;
         h.write(w);
         w.put_bytes(tokens, (size_t) n * sizeof(llama_token));
@@ -651,8 +671,11 @@ struct chain_eval : evaluator {
         std::vector<uint8_t> body = expect(conns.size() - 1, msg::result);
         reader r(body.data(), body.size());
         result_msg res = result_msg::read(r);
-        if (res.step != step || res.n_out < 1) {
+        if (res.step != step || res.n_out != (out_all ? n : 1)) {
             throw std::runtime_error("result for step " + std::to_string(res.step) + ", expected " + std::to_string(step));
+        }
+        if (out_all) {
+            return res.top;
         }
         return std::vector<top_entry>(res.top.end() - res.n_top, res.top.end());
     }
@@ -678,11 +701,12 @@ struct local_eval : evaluator {
     local_eval(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_top)
         : part(model, mo, n_ctx, n_threads), n_top(n_top) {}
 
-    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0) override {
+    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) override {
         forward_hdr h;
         h.pos0     = pos0;
         h.n_tokens = n;
         h.kind     = payload::tokens;
+        h.flags    = out_all ? FORWARD_OUT_ALL : 0;
         std::vector<float>     hidden;
         std::vector<top_entry> top;
         uint32_t n_out = 0;
@@ -780,7 +804,12 @@ struct gen_result {
     int32_t n_prompt   = 0;
     double  prefill_ms = 0;
     double  gen_ms     = 0;
-    int32_t n_gen_eval = 0; // single-token forwards timed in gen_ms
+    int32_t n_gen_eval = 0; // tokens produced in gen_ms (after the first one, which comes with the prompt)
+    // speculative decoding
+    int32_t n_rounds   = 0; // passes over the chain
+    int32_t n_drafted  = 0;
+    int32_t n_accepted = 0;
+    double  draft_ms   = 0; // time of the draft model on the client
 };
 
 // before_gen is called after the prompt, when the timed generation starts
@@ -843,11 +872,208 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
     return res;
 }
 
+// the draft model of speculative decoding, on the client
+//
+// it proposes tokens one at a time, so its recurrent snapshots (which cover only the last decode) cannot undo them:
+// before every draft the recurrent state is saved (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, a few MB), after the check
+// it is restored and the accepted tokens are decoded again in one batch
+struct draft_model {
+    llama_model_ptr      model;
+    llama_context_ptr    ctx;
+    int32_t              n_vocab = 0;
+    std::vector<uint8_t> ckpt;
+    std::vector<top_entry> top1 = std::vector<top_entry>(1);
+
+    draft_model(const model_opts & mo, uint32_t n_ctx, int32_t n_threads) {
+        model   = load_model(mo);
+        n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx           = n_ctx;
+        cp.n_batch         = 512;
+        cp.n_ubatch        = 512;
+        cp.n_seq_max       = 1;
+        cp.n_threads       = n_threads;
+        cp.n_threads_batch = n_threads;
+        cp.no_perf         = true;
+        ctx.reset(llama_init_from_model(model.get(), cp));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the context of the draft model");
+        }
+    }
+
+    // decodes n tokens from pos0, returns the greedy next token
+    llama_token decode(const llama_token * tokens, uint32_t n, int32_t pos0) {
+        common_batch batch(ctx.get());
+        for (uint32_t i = 0; i < n; i++) {
+            batch.add(tokens[i], pos0 + (int32_t) i, 0, i + 1 == n);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("draft model: llama_process failed");
+        }
+        top_k(llama_get_logits_ith(ctx.get(), (int32_t) n - 1), n_vocab, 1, top1.data());
+        return top1[0].id;
+    }
+
+    void save() {
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        ckpt.resize(llama_state_seq_get_size_ext(ctx.get(), 0, fl));
+        if (!ckpt.empty() && llama_state_seq_get_data_ext(ctx.get(), ckpt.data(), ckpt.size(), 0, fl) != ckpt.size()) {
+            throw std::runtime_error("draft model: cannot save the recurrent state");
+        }
+    }
+
+    // back to the state saved at position pos (the tokens before pos are processed)
+    void restore(int32_t pos) {
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        if (!ckpt.empty() && llama_state_seq_set_data_ext(ctx.get(), ckpt.data(), ckpt.size(), 0, fl) != ckpt.size()) {
+            throw std::runtime_error("draft model: cannot restore the recurrent state");
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos, -1)) {
+            throw std::runtime_error("draft model: cannot remove the rejected tokens");
+        }
+    }
+};
+
+// speculative decoding over the chain: the draft model proposes n_draft tokens, one pass over the chain checks
+// them all, the longest matching prefix is accepted plus the token of the chain after it. Greedy, so the text is the
+// one the chain would write alone (up to the numeric difference of checking several tokens in one batch)
+// noise: for tests, the share of draft tokens replaced by another token (to exercise partial acceptance)
+static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_vocab * vocab, const std::vector<llama_token> & prompt,
+        const gen_opts & g, int32_t n_draft, double noise, const std::function<void()> & before_gen) {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    if ((uint32_t) (prompt.size() + g.n_gen + n_draft + 1) > g.n_ctx) {
+        throw std::runtime_error("prompt + generation does not fit in the context, increase -c");
+    }
+    FILE * dump = nullptr;
+    if (!g.dump.empty()) {
+        dump = fopen_utf8(g.dump, "w");
+        if (!dump) {
+            throw std::runtime_error("cannot write " + g.dump);
+        }
+        fprintf(dump, "# agent-node dump v1 n_top=%u n_prompt=%zu draft=%d\n", g.n_top, prompt.size(), n_draft);
+    }
+
+    gen_result res;
+    res.n_prompt = (int32_t) prompt.size();
+
+    double t0 = now_ms();
+    std::vector<top_entry> top;
+    for (size_t i = 0; i < prompt.size(); i += g.n_batch) {
+        const uint32_t n = (uint32_t) std::min<size_t>(g.n_batch, prompt.size() - i);
+        top = ev.eval(prompt.data() + i, n, (int32_t) i);
+    }
+    res.prefill_ms = now_ms() - t0;
+
+    // the draft model reads the prompt too, except its last token: every round starts by decoding the last token
+    t0 = now_ms();
+    for (size_t i = 0; i + 1 < prompt.size(); i += g.n_batch) {
+        const uint32_t n = (uint32_t) std::min<size_t>(g.n_batch, prompt.size() - 1 - i);
+        dm.decode(prompt.data() + i, n, (int32_t) i);
+    }
+    res.draft_ms += now_ms() - t0;
+
+    if (before_gen) {
+        before_gen();
+    }
+
+    // emits one token, returns true when the generation is over
+    int32_t n_out = 0;
+    auto emit = [&](llama_token tok, const top_entry * row) {
+        res.tokens.push_back(tok);
+        if (dump) {
+            fprintf(dump, "%d %d", n_out, tok);
+            for (uint32_t k = 0; row && k < g.n_top; k++) {
+                fprintf(dump, " %d:%.6f", row[k].id, row[k].logit);
+            }
+            fprintf(dump, "\n");
+        }
+        printf("%s", common_token_to_piece(vocab, tok, false).c_str());
+        fflush(stdout);
+        n_out++;
+        return n_out == g.n_gen || (!g.ignore_eos && llama_vocab_is_eog(vocab, tok));
+    };
+
+    // the first token comes from the prompt; the draft model has not seen the last prompt token yet
+    llama_token last = top[0].id;
+    int32_t     pos  = (int32_t) prompt.size(); // position of `last` for the chain
+    bool done = emit(last, top.data());
+
+    // the draft model lags one token behind: it still has to process prompt.back() at pos - 1
+    {
+        const double td = now_ms();
+        dm.decode(&prompt.back(), 1, pos - 1);
+        res.draft_ms += now_ms() - td;
+    }
+
+    t0 = now_ms();
+    std::vector<llama_token> batch;
+    while (!done) {
+        const int32_t k = std::min<int32_t>(n_draft, g.n_gen - n_out);
+
+        // 1. the draft model proposes k tokens after `last`
+        const double td = now_ms();
+        dm.save();
+        batch.assign(1, last);
+        llama_token cur = last;
+        for (int32_t j = 0; j < k; j++) {
+            cur = dm.decode(&cur, 1, pos + j);
+            if (noise > 0 && uni(rng) < noise) {
+                cur = (cur + 1) % dm.n_vocab;
+            }
+            batch.push_back(cur);
+        }
+        res.draft_ms += now_ms() - td;
+
+        // 2. one pass over the chain: the greedy choice of the model after every token of the batch
+        const std::vector<top_entry> rows = ev.eval(batch.data(), (uint32_t) batch.size(), pos, true);
+        res.n_rounds++;
+        res.n_drafted += k;
+
+        // 3. accept the matching prefix, then the token of the chain after it
+        int32_t a = 0;
+        while (a < k && rows[(size_t) a * g.n_top].id == batch[a + 1]) {
+            a++;
+        }
+        res.n_accepted += a;
+        for (int32_t j = 0; j < a && !done; j++) {
+            done = emit(batch[j + 1], &rows[(size_t) j * g.n_top]);
+        }
+        if (done) {
+            break;
+        }
+        const llama_token bonus = rows[(size_t) a * g.n_top].id;
+        done = emit(bonus, &rows[(size_t) a * g.n_top]);
+
+        // 4. the draft model goes back to `pos` and reads the accepted tokens in one batch;
+        //    the nodes roll back by themselves when the next forward starts at pos + a + 1
+        const double tr = now_ms();
+        dm.restore(pos);
+        dm.decode(batch.data(), (uint32_t) a + 1, pos);
+        res.draft_ms += now_ms() - tr;
+
+        last = bonus;
+        pos += a + 1;
+    }
+    res.gen_ms     = now_ms() - t0;
+    res.n_gen_eval = (int32_t) res.tokens.size() - 1;
+    printf("\n");
+    if (dump) {
+        fclose(dump);
+    }
+    return res;
+}
+
 static void print_speed(const gen_result & r) {
     AN_LOG("prompt: %d tokens in %.1f ms (%.1f tok/s)\n", r.n_prompt, r.prefill_ms, r.n_prompt * 1000.0 / std::max(r.prefill_ms, 1e-9));
     if (r.n_gen_eval > 0) {
         AN_LOG("generation: %d tokens in %.1f ms (%.2f tok/s, %.2f ms/token)\n", r.n_gen_eval, r.gen_ms,
             r.n_gen_eval * 1000.0 / r.gen_ms, r.gen_ms / r.n_gen_eval);
+    }
+    if (r.n_rounds > 0) {
+        AN_LOG("speculative: %d passes over the chain, %.2f tokens per pass, %d of %d draft tokens accepted (%.0f%%), draft model %.1f ms\n",
+            r.n_rounds, (double) r.tokens.size() / r.n_rounds, r.n_accepted, r.n_drafted,
+            100.0 * r.n_accepted / std::max(1, r.n_drafted), r.draft_ms);
     }
 }
 
@@ -876,21 +1102,45 @@ static int cmd_client(const cli_args & a) {
 
     const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
 
-    chain_eval chain(addrs, g.n_ctx, g.n_top, g.hidden);
+    // speculative decoding: a small draft model on the client, --draft-max tokens per pass over the chain
+    std::unique_ptr<draft_model> dm;
+    const int32_t n_draft = a.get_int("--draft-max", "", 6);
+    if (a.has("--draft")) {
+        if (n_draft < 1 || n_draft > 32) {
+            throw std::runtime_error("--draft-max must be 1..32");
+        }
+        if (!g.force.empty()) {
+            throw std::runtime_error("--force and --draft cannot be combined");
+        }
+        model_opts dmo;
+        dmo.path         = a.get("--draft", "", "");
+        dmo.n_gpu_layers = a.get_int("-ngld", "--draft-ngl", 999);
+        dmo.device       = a.get("--device", "-dev", "");
+        dm = std::make_unique<draft_model>(dmo, g.n_ctx, a.get_int("-t", "--threads", common_cpu_get_num_math()));
+        if (dm->n_vocab != llama_vocab_n_tokens(vocab)) {
+            throw std::runtime_error("the draft model has another vocabulary than the chain");
+        }
+    }
+
+    chain_eval chain(addrs, g.n_ctx, g.n_top, g.hidden, dm ? (uint32_t) n_draft : 0);
     if (chain.parts[0].n_vocab != llama_vocab_n_tokens(vocab)) {
         throw std::runtime_error("the tokenizer does not match the model of the chain");
     }
 
     std::vector<stats_msg> st0;
-    const gen_result r = generate(chain, vocab, prompt, g, [&]() { st0 = chain.stats(); });
+    auto before_gen = [&]() { st0 = chain.stats(); };
+    const double noise = std::stod(a.get("--draft-noise", "", "0"));
+    const gen_result r = dm ? generate_spec(chain, *dm, vocab, prompt, g, n_draft, noise, before_gen)
+                            : generate(chain, vocab, prompt, g, before_gen);
     const std::vector<stats_msg> st1 = chain.stats();
 
     print_speed(r);
 
-    // traffic of the timed generation: every forward carries one token
+    // traffic and compute of the timed generation per generated token
+    // (with a draft model the nodes also process the rejected draft tokens)
     std::ostringstream nodes_json;
     for (size_t i = 0; i < st1.size(); i++) {
-        const double n   = std::max<double>(1, (double) (st1[i].n_tokens - st0[i].n_tokens));
+        const double n   = std::max<double>(1, (double) r.n_gen_eval);
         const double in  = (st1[i].bytes_in  - st0[i].bytes_in)  / n;
         const double out = (st1[i].bytes_out - st0[i].bytes_out) / n;
         const double cms = (st1[i].compute_ms - st0[i].compute_ms) / n;
@@ -906,6 +1156,8 @@ static int cmd_client(const cli_args & a) {
           << ",\"prefill_ms\":" << r.prefill_ms << ",\"n_gen\":" << r.n_gen_eval << ",\"gen_ms\":" << r.gen_ms
           << ",\"tg_tok_s\":" << (r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0)
           << ",\"pp_tok_s\":" << r.n_prompt * 1000.0 / std::max(r.prefill_ms, 1e-9)
+          << ",\"draft_max\":" << (dm ? n_draft : 0) << ",\"n_rounds\":" << r.n_rounds
+          << ",\"n_drafted\":" << r.n_drafted << ",\"n_accepted\":" << r.n_accepted << ",\"draft_ms\":" << r.draft_ms
           << ",\"nodes\":[" << nodes_json.str() << "]}\n";
     }
     return 0;
@@ -1017,6 +1269,7 @@ static void usage() {
         "  agent-node client    -m model.gguf --chain HOST:PORT,HOST:PORT,... [-p TEXT | -f FILE] [-n 64] [-c 4096]\n"
         "                       [--top 8] [--ignore-eos] [--no-chat] [--dump FILE] [--json FILE]\n"
         "                       [--hidden f16|f32] [--force REFERENCE_DUMP]\n"
+        "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]]   speculative decoding\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
