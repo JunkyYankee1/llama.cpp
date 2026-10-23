@@ -237,6 +237,7 @@ struct model_part {
     int32_t first = 0, last = 0, n_layer = 0, n_embd = 0, n_vocab = 0;
     int32_t n_batch = 512;
     int32_t n_past  = 0; // tokens in the memory: the next forward continues at this position
+    double  last_output_ms = 0; // time of reading the outputs in the last run()
 
     std::vector<float> hidden_in;
 
@@ -327,6 +328,11 @@ struct model_part {
             throw std::runtime_error("llama_process failed at position " + std::to_string(h.pos0));
         }
         n_past = h.pos0 + (int32_t) h.n_tokens;
+        const double t_out = now_ms();
+        struct out_timer {
+            double t0; double & dst;
+            ~out_timer() { dst = now_ms() - t0; }
+        } timer { t_out, last_output_ms };
 
         if (!is_last()) {
             hidden_out.resize((size_t) h.n_tokens * n_embd);
@@ -475,6 +481,7 @@ struct node_server {
         const double t0 = now_ms();
         p.run(h, data, hidden, top, s->n_top, n_out);
         s->st.compute_ms += now_ms() - t0;
+        s->st.output_ms  += p.last_output_ms;
 
         if (!p.is_last()) {
             forward_hdr out = h;
@@ -1167,10 +1174,12 @@ static int cmd_client(const cli_args & a) {
         const double in  = (st1[i].bytes_in  - st0[i].bytes_in)  / n;
         const double out = (st1[i].bytes_out - st0[i].bytes_out) / n;
         const double cms = (st1[i].compute_ms - st0[i].compute_ms) / n;
-        AN_LOG("node %zu: %.0f bytes in + %.0f bytes out per token, compute %.2f ms/token\n", i, in, out, cms);
+        const double oms = (st1[i].output_ms - st0[i].output_ms) / n;
+        AN_LOG("node %zu: %.0f bytes in + %.0f bytes out per token, compute %.2f ms/token (of it reading outputs %.2f)\n", i, in, out, cms, oms);
         nodes_json << (i ? "," : "") << "{\"addr\":\"" << addrs[i] << "\",\"layer_start\":" << chain.parts[i].layer_start
                    << ",\"layer_end\":" << chain.parts[i].layer_end << ",\"bytes_in_per_token\":" << in
-                   << ",\"bytes_out_per_token\":" << out << ",\"compute_ms_per_token\":" << cms << "}";
+                   << ",\"bytes_out_per_token\":" << out << ",\"compute_ms_per_token\":" << cms
+                   << ",\"output_ms_per_token\":" << oms << "}";
     }
 
     if (!g.json.empty()) {

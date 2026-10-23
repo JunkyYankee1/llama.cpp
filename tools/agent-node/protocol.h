@@ -274,11 +274,12 @@ struct stats_msg {
     uint64_t bytes_out  = 0; // forward and result frames sent for the session
     uint64_t n_tokens   = 0;
     uint64_t n_forward  = 0;
-    double   compute_ms = 0; // time spent in llama_process
+    double   compute_ms = 0; // time spent in llama_process and in reading its outputs
+    double   output_ms  = 0; // of it: reading the outputs (hidden states or logits and top-k)
 
     writer write() const {
         writer w;
-        w.put(bytes_in).put(bytes_out).put(n_tokens).put(n_forward).put(compute_ms);
+        w.put(bytes_in).put(bytes_out).put(n_tokens).put(n_forward).put(compute_ms).put(output_ms);
         return w;
     }
     static stats_msg read(reader & r) {
@@ -288,6 +289,9 @@ struct stats_msg {
         m.n_tokens   = r.get<uint64_t>();
         m.n_forward  = r.get<uint64_t>();
         m.compute_ms = r.get<double>();
+        if (r.left() >= 8) {
+            m.output_ms = r.get<double>();
+        }
         return m;
     }
 };
