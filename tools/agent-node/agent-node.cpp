@@ -32,7 +32,6 @@
 #include <fstream>
 #include <functional>
 #include <map>
-#include <numeric>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -213,15 +212,22 @@ static std::string model_desc(const llama_model * model) {
 // one part of the model: [layer_start, layer_end) in this process
 //
 
+// the k largest logits, sorted descending (ties: the smaller id first), in one pass without allocations:
+// a vocabulary of 248k tokens made a sort per token cost milliseconds, for every checked draft token
 static void top_k(const float * logits, int32_t n_vocab, uint32_t k, top_entry * out) {
     k = std::min<uint32_t>(k, (uint32_t) n_vocab);
-    std::vector<int32_t> idx(n_vocab);
-    std::iota(idx.begin(), idx.end(), 0);
-    auto gt = [&](int32_t a, int32_t b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); };
-    std::nth_element(idx.begin(), idx.begin() + (k - 1), idx.end(), gt);
-    std::sort(idx.begin(), idx.begin() + k, gt);
-    for (uint32_t i = 0; i < k; i++) {
-        out[i] = { idx[i], logits[idx[i]] };
+    uint32_t n = 0;
+    for (int32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (n == k && !(v > out[k - 1].logit)) {
+            continue;
+        }
+        uint32_t j = n < k ? n++ : k - 1;
+        while (j > 0 && out[j - 1].logit < v) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = { i, v };
     }
 }
 
@@ -823,6 +829,7 @@ struct gen_result {
     int32_t n_drafted  = 0;
     int32_t n_accepted = 0;
     double  draft_ms   = 0; // time of the draft model on the client
+    double  verify_ms  = 0; // time of the passes over the chain that check the drafts
 };
 
 // before_gen is called after the prompt, when the timed generation starts
@@ -1039,7 +1046,9 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
         res.draft_ms += now_ms() - td;
 
         // 2. one pass over the chain: the greedy choice of the model after every token of the batch
+        const double tv = now_ms();
         const std::vector<top_entry> rows = ev.eval(batch.data(), (uint32_t) batch.size(), pos, true);
+        res.verify_ms += now_ms() - tv;
         res.n_rounds++;
         res.n_drafted += k;
 
@@ -1087,6 +1096,7 @@ static void print_speed(const gen_result & r) {
         AN_LOG("speculative: %d passes over the chain, %.2f tokens per pass, %d of %d draft tokens accepted (%.0f%%), draft model %.1f ms\n",
             r.n_rounds, (double) r.tokens.size() / r.n_rounds, r.n_accepted, r.n_drafted,
             100.0 * r.n_accepted / std::max(1, r.n_drafted), r.draft_ms);
+        AN_LOG("per pass: draft model %.1f ms, chain %.1f ms\n", r.draft_ms / r.n_rounds, r.verify_ms / r.n_rounds);
     }
 }
 
@@ -1170,7 +1180,7 @@ static int cmd_client(const cli_args & a) {
           << ",\"tg_tok_s\":" << (r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0)
           << ",\"pp_tok_s\":" << r.n_prompt * 1000.0 / std::max(r.prefill_ms, 1e-9)
           << ",\"draft_max\":" << (dm ? n_draft : 0) << ",\"n_rounds\":" << r.n_rounds
-          << ",\"n_drafted\":" << r.n_drafted << ",\"n_accepted\":" << r.n_accepted << ",\"draft_ms\":" << r.draft_ms
+          << ",\"n_drafted\":" << r.n_drafted << ",\"n_accepted\":" << r.n_accepted << ",\"draft_ms\":" << r.draft_ms << ",\"verify_ms\":" << r.verify_ms
           << ",\"nodes\":[" << nodes_json.str() << "]}\n";
     }
     return 0;
