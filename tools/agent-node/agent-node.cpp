@@ -84,6 +84,18 @@ struct cli_args {
         if (has("-v") || has("--verbose")) {
             g_verbose = 1;
         }
+        // an unknown option must not be ignored silently (an old build would run without a feature asked for)
+        static const char * known[] = {
+            "--chain", "--ctx-size", "--device", "--draft", "--draft-max", "--draft-ngl", "--draft-noise", "--dump", "--file",
+            "--force", "--hidden", "--host", "--ignore-eos", "--json", "--layers", "--model", "--n-gpu-layers", "--n-predict",
+            "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
+            "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
+        };
+        for (const auto & [name, value] : opts) {
+            if (std::find_if(std::begin(known), std::end(known), [&](const char * k) { return name == k; }) == std::end(known)) {
+                throw std::runtime_error("unknown option " + name);
+            }
+        }
     }
 
     bool has(const std::string & name) const { return opts.count(name) > 0; }
