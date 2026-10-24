@@ -100,6 +100,7 @@ struct cli_args {
             "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
+            "--keep-warm", "--keep-warm-mb",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -389,11 +390,92 @@ struct session {
     stats_msg                   st;
 };
 
+// keeps the GPU of a node awake between tokens. On a network the node waits ~100+ ms for every token; meanwhile the GPU
+// lowers its clocks and the next token runs 1.8x slower on one PC and 4-12x slower on home PCs (bench/RESULTS.md),
+// and the power setting of the NVIDIA control panel does not help CUDA. While a session is open and the node waits,
+// a small memory-bound job (adding two buffers) runs every interval on its own backend instance
+struct gpu_warmer {
+    ggml_backend_t        be  = nullptr;
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_cgraph *         gf  = nullptr;
+    std::atomic<bool>     stop{ false };
+    std::atomic<int64_t>  n_jobs{ 0 };
+    std::thread           th;
+
+    // false: no GPU for this device (CPU nodes need no warming)
+    bool init(const std::string & device, size_t mb) {
+        ggml_backend_dev_t dev = device.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
+                                                : ggml_backend_dev_by_name(device.c_str());
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return false;
+        }
+        be = ggml_backend_dev_init(dev, nullptr);
+        if (be == nullptr) {
+            return false;
+        }
+        ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+        ctx = ggml_init(ip);
+        const int64_t n = (int64_t) (std::max<size_t>(mb, 1) << 20) / 3 / (int64_t) sizeof(float); // a, b and a + b
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, ggml_add(ctx, a, b));
+        buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        return true;
+    }
+
+    double run() {
+        const double t0 = now_ms();
+        ggml_backend_graph_compute(be, gf);
+        n_jobs++;
+        return now_ms() - t0;
+    }
+
+    // idle(): a session is open and the node has been waiting for at least the interval
+    void start(int interval_ms, std::function<bool()> idle) {
+        th = std::thread([this, interval_ms, idle]() {
+            while (!stop) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+                if (idle()) {
+                    run();
+                }
+            }
+        });
+    }
+
+    ~gpu_warmer() {
+        stop = true;
+        if (th.joinable()) {
+            th.join();
+        }
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        if (be)  ggml_backend_free(be);
+    }
+};
+
 struct node_server {
     llama_model_ptr model;
     model_opts      mo;
     int32_t         n_threads = 4;
     uint32_t        max_sessions = 4;
+
+    // for the GPU warmer: forwards running now and the end of the last one
+    std::atomic<int>     busy{ 0 };
+    std::atomic<int64_t> last_end_us{ 0 };
+
+    bool waiting_with_session(int interval_ms) {
+        if (busy > 0 || (int64_t) (now_ms() * 1000) - last_end_us < (int64_t) interval_ms * 1000) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        return !sessions.empty();
+    }
 
     std::vector<uint8_t> key;                 // secret key: open and attach need an access token; empty: open node (tests)
     void *               server_ctx = nullptr; // SSL_CTX of incoming connections, null: plain TCP
@@ -524,7 +606,14 @@ struct node_server {
         uint32_t n_out = 0;
 
         const double t0 = now_ms();
-        p.run(h, data, hidden, top, s->n_top, n_out);
+        {
+            struct busy_guard {
+                node_server & srv;
+                busy_guard(node_server & srv) : srv(srv) { srv.busy++; }
+                ~busy_guard() { srv.last_end_us = (int64_t) (now_ms() * 1000); srv.busy--; }
+            } guard(*this);
+            p.run(h, data, hidden, top, s->n_top, n_out);
+        }
         s->st.compute_ms += now_ms() - t0;
         s->st.output_ms  += p.last_output_ms;
 
@@ -739,6 +828,16 @@ static int cmd_node(const cli_args & a) {
     if (a.has("--coordinator")) {
         ms_per_layer = measure_ms_per_layer(srv.model.get(), srv.mo, srv.n_threads);
         AN_LOG("node: %.3f ms per layer per token\n", ms_per_layer);
+    }
+
+    // keep the GPU awake while a session waits for the next token (--keep-warm 0: off)
+    gpu_warmer warmer;
+    const int warm_ms = a.get_int("--keep-warm", "", 5);
+    if (warm_ms > 0 && warmer.init(srv.mo.device, (size_t) a.get_int("--keep-warm-mb", "", 24))) {
+        warmer.run();
+        const double job_ms = warmer.run();
+        AN_LOG("node: keeping the GPU awake between tokens: a job of %.2f ms every %d ms while a session waits\n", job_ms, warm_ms);
+        warmer.start(warm_ms, [&srv, warm_ms]() { return srv.waiting_with_session(warm_ms); });
     }
 
     tcp_listener ln(host, port);
@@ -1959,6 +2058,7 @@ static void usage() {
         "security: node [--key HEX | env AGENT_NODE_KEY] [--tls --identity node.pem]\n"
         "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
         "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
+        "gpu:      node [--keep-warm 5] [--keep-warm-mb 24]   keep the GPU awake between tokens (ms, 0: off)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
         "\n"
