@@ -9,6 +9,7 @@
 // the last node sends the top-k logits back to the client: one transfer per node per token
 
 #include "coordinator.h"
+#include "gpu_clocks.h"
 #include "protocol.h"
 #include "secure.h"
 
@@ -100,7 +101,7 @@ struct cli_args {
             "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
-            "--keep-warm", "--keep-warm-mb",
+            "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -830,9 +831,65 @@ static int cmd_node(const cli_args & a) {
         AN_LOG("node: %.3f ms per layer per token\n", ms_per_layer);
     }
 
-    // keep the GPU awake while a session waits for the next token (--keep-warm 0: off)
+    // hold the GPU clocks while there are sessions: between tokens the GPU would drop to a power-saving state
+    static gpu_clocks clocks; // static: the console handler resets the clocks when the window is closed
+    std::thread clocks_thread;
+    if (a.get("--gpu-clocks", "", "auto") != "off") {
+        ggml_backend_dev_t dev = srv.mo.device.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
+                                                       : ggml_backend_dev_by_name(srv.mo.device.c_str());
+        ggml_backend_dev_props props = {};
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ggml_backend_dev_get_props(dev, &props);
+        }
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && std::string(ggml_backend_dev_name(dev)).rfind("CUDA", 0) == 0 &&
+            clocks.open(props.device_id)) {
+            // a lock left by a node that was killed
+            clocks.locked = true;
+            clocks.unlock();
+#ifdef _WIN32
+            SetConsoleCtrlHandler([](DWORD) -> BOOL { clocks.unlock(); return FALSE; }, TRUE);
+#else
+            for (int sig : { SIGINT, SIGTERM }) {
+                std::signal(sig, [](int) { clocks.unlock(); _exit(1); });
+            }
+#endif
+            if (clocks.lock()) {
+                clocks.unlock();
+                AN_LOG("node: GPU clocks are held at %u-%u MHz while there are sessions\n", clocks.gpu_max * 4 / 5, clocks.gpu_max);
+                clocks_thread = std::thread([&srv]() {
+                    double idle_since = -1;
+                    while (true) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        bool busy;
+                        {
+                            std::lock_guard<std::mutex> lock(srv.mtx);
+                            busy = !srv.sessions.empty();
+                        }
+                        if (busy) {
+                            idle_since = -1;
+                            clocks.lock();
+                        } else if (clocks.locked) {
+                            if (idle_since < 0) {
+                                idle_since = now_ms();
+                            } else if (now_ms() - idle_since > 10000) {
+                                clocks.unlock();
+                            }
+                        }
+                    }
+                });
+                clocks_thread.detach();
+            } else {
+                AN_LOG("warning: cannot hold the GPU clocks: %s; on a network the GPU will be slower between tokens\n", clocks.err.c_str());
+            }
+        } else if (!clocks.err.empty()) {
+            AN_LOG("warning: GPU clocks: %s\n", clocks.err.c_str());
+        }
+    }
+
+    // keep the GPU awake while a session waits for the next token (--keep-warm MS; off by default: holding the clocks works
+    // better, the warmer only helps partly and slows real work a little, bench/RESULTS.md)
     gpu_warmer warmer;
-    const int warm_ms = a.get_int("--keep-warm", "", 5);
+    const int warm_ms = a.get_int("--keep-warm", "", 0);
     if (warm_ms > 0 && warmer.init(srv.mo.device, (size_t) a.get_int("--keep-warm-mb", "", 24))) {
         warmer.run();
         const double job_ms = warmer.run();
@@ -2058,7 +2115,8 @@ static void usage() {
         "security: node [--key HEX | env AGENT_NODE_KEY] [--tls --identity node.pem]\n"
         "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
         "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
-        "gpu:      node [--keep-warm 5] [--keep-warm-mb 24]   keep the GPU awake between tokens (ms, 0: off)\n"
+        "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
+        "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
         "\n"
