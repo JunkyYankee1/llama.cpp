@@ -5,7 +5,7 @@
 //   agent-node reference -m model.gguf -p "Hello" -n 64 --dump ref.txt
 //   agent-node compare   chain.txt ref.txt
 //
-// the client sends tokens to the first node, every node sends its hidden states (fp16) straight to the next one,
+// the client sends tokens to the first node, every node sends its hidden states (int8) straight to the next one,
 // the last node sends the top-k logits back to the client: one transfer per node per token
 
 #include "coordinator.h"
@@ -813,7 +813,7 @@ struct chain_opts {
     int      timeout_ms     = 3000;  // a node that does not answer in time counts as failed (plus 20 ms per token of a batch)
     uint32_t n_ctx          = 4096;
     uint32_t n_top          = 8;
-    payload  hidden         = payload::f16;
+    payload  hidden         = payload::q8; // int8: the quality of fp16 at half the traffic (T5)
     uint32_t n_rollback     = 0;
     uint64_t session        = 0;    // 0: chosen by the client
     uint64_t token_ttl      = 3600;
@@ -1251,7 +1251,7 @@ struct gen_opts {
     std::string dump;
     std::string json;
     std::vector<llama_token> force; // follow these tokens instead of the greedy choice (from a reference dump)
-    payload     hidden = payload::f16;
+    payload     hidden = payload::q8;
 };
 
 static gen_opts gen_opts_from(const cli_args & a) {
@@ -1275,7 +1275,7 @@ static gen_opts gen_opts_from(const cli_args & a) {
             g.force.push_back(d.token);
         }
     }
-    const std::string hidden = a.get("--hidden", "", "f16");
+    const std::string hidden = a.get("--hidden", "", "q8");
     if (hidden != "f16" && hidden != "f32" && hidden != "q8") {
         throw std::runtime_error("--hidden must be f16, f32 or q8");
     }
@@ -1947,7 +1947,7 @@ static void usage() {
         "  agent-node node      -m model.gguf --layers START:END [--host 127.0.0.1] [--port 50152] [-ngl 999] [--device CUDA0] [-t N]\n"
         "  agent-node client    -m model.gguf --chain HOST:PORT,HOST:PORT,... [-p TEXT | -f FILE] [-n 64] [-c 4096]\n"
         "                       [--top 8] [--ignore-eos] [--no-chat] [--dump FILE] [--json FILE]\n"
-        "                       [--hidden f16|f32|q8] [--force REFERENCE_DUMP]\n"
+        "                       [--hidden q8|f16|f32] [--force REFERENCE_DUMP]\n"
         "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]]   speculative decoding\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"

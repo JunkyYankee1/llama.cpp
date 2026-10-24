@@ -3,12 +3,13 @@
 One part of a model in a chain of nodes, and the client that drives the chain.
 
 ```
-client --tokens--> node A [layers 0..a) --fp16 hidden--> node B [a..b) --> ... --> node K [k..n) --top-k logits--> client
+client --tokens--> node A [layers 0..a) --int8 hidden--> node B [a..b) --> ... --> node K [k..n) --top-k logits--> client
 ```
 
 Every node runs a layer range of the model (`llama_model_params.layer_start/layer_end`) and loads only the
 weights of its layers. Per token each node receives one frame and sends one frame: the hidden state of the token
-in fp16 (`2 * n_embd` bytes plus a 27-byte header). The last node returns the top-k logits to the client.
+as ggml Q8_0 blocks (`34/32 * n_embd` bytes plus a 27-byte header; `--hidden f16` or `f32` on request).
+The last node returns the top-k logits to the client.
 
 ## Usage
 
@@ -92,3 +93,20 @@ Not done yet (see the transport spec of the agent repository): replay of the for
 instead of reading the whole context again (long contexts), int8 hidden states.
 
 Supported architectures: those with layer range support (llama, qwen35, qwen35moe).
+
+## Coordinator
+
+The coordinator (`server/cmd/coordinator` in the agent repository) hands out chains, so the client needs no list
+of nodes, keys or pins:
+
+```sh
+agent-node node -m model.gguf --layers 0:12 --tls --identity n0.pem --key HEX --coordinator http://coord:8080 \
+    [--public-addr HOST:PORT] [--city NAME]
+agent-node client -m model.gguf --coordinator http://coord:8080 -p "Hello" [--spares 1]
+```
+
+- The node measures its milliseconds per layer per token, then registers its address, certificate fingerprint,
+  key, model key (`agent-node info`) and layer range. The coordinator connects to it with that pin and checks
+  `hello` before it hands the node out. Heartbeats are signed: `Node <expiry>:<hex HMAC(key, "agent-coord/1|<id>|<expiry>")>`.
+- The client asks `POST /v1/chains` with the model key; the reply has the session, the nodes and spares with
+  their addresses, pins and session tokens.
