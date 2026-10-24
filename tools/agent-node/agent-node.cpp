@@ -8,6 +8,7 @@
 // the client sends tokens to the first node, every node sends its hidden states (fp16) straight to the next one,
 // the last node sends the top-k logits back to the client: one transfer per node per token
 
+#include "coordinator.h"
 #include "protocol.h"
 #include "secure.h"
 
@@ -98,7 +99,7 @@ struct cli_args {
             "--force", "--hidden", "--host", "--ignore-eos", "--json", "--layers", "--model", "--n-gpu-layers", "--n-predict",
             "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
-            "--token-ttl", "--key", "--identity", "--ttl",
+            "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -648,6 +649,8 @@ struct node_server {
     }
 };
 
+static std::string model_key(const std::string & path);
+
 static int cmd_node(const cli_args & a) {
     node_server srv;
     srv.mo        = model_opts_from(a);
@@ -703,6 +706,38 @@ static int cmd_node(const cli_args & a) {
     // the scripts wait for this line
     printf("agent-node ready on %s:%d%s%s\n", host.c_str(), port, fingerprint.empty() ? "" : " tls ", fingerprint.c_str());
     fflush(stdout);
+
+    // the coordinator hands this node out in chains; it needs the address, the pin and the key to issue tokens
+    coord_link link;
+    std::thread link_thread;
+    if (a.has("--coordinator")) {
+        if (srv.key.empty() || fingerprint.empty()) {
+            throw std::runtime_error("--coordinator needs --tls and --key: the coordinator only hands out protected nodes");
+        }
+        const int32_t n_layer = llama_model_n_layer(srv.model.get());
+        // an empty host: the coordinator takes the address the registration came from
+        const std::string pub = a.get("--public-addr", "", (host == "0.0.0.0" || host == "::" ? "" : host) + ":" + std::to_string(port));
+        link.url  = a.get("--coordinator", "", "");
+        link.key  = srv.key;
+        link.reg  = json{
+            { "addr", pub },
+            { "tls_fingerprint", fingerprint },
+            { "node_key", key_hex },
+            { "model", model_key(srv.mo.path) },
+            { "desc", model_desc(srv.model.get()) },
+            { "n_layer", n_layer },
+            { "layer_start", std::clamp(srv.mo.layer_start, 0, n_layer) },
+            { "layer_end", srv.mo.layer_end <= 0 ? n_layer : std::min(srv.mo.layer_end, n_layer) },
+            { "max_sessions", srv.max_sessions },
+            { "city", a.get("--city", "", "") },
+        };
+        link.sessions = [&srv]() {
+            std::lock_guard<std::mutex> lock(srv.mtx);
+            return (int) srv.sessions.size();
+        };
+        link_thread = std::thread([&link]() { link.run(); });
+        link_thread.detach();
+    }
 
     while (true) {
         tcp_conn_ptr c = ln.accept();
@@ -1514,8 +1549,8 @@ static int cmd_client(const cli_args & a) {
             }
         }
     }
-    if (addrs.empty()) {
-        throw std::runtime_error("--chain host:port,host:port,... is required");
+    if (addrs.empty() == !a.has("--coordinator")) {
+        throw std::runtime_error("either --chain host:port,host:port,... or --coordinator URL is required");
     }
 
     // the client only needs the tokenizer
@@ -1523,6 +1558,39 @@ static int cmd_client(const cli_args & a) {
     mo.vocab_only = true;
     llama_model_ptr model = load_model(mo);
     const llama_vocab * vocab = llama_model_get_vocab(model.get());
+
+    // a chain from the coordinator: nodes and spares with their pins and tokens for one session
+    std::vector<node_ref> coord_nodes, coord_spares;
+    uint64_t coord_session = 0;
+    if (a.has("--coordinator")) {
+        json req = { { "model", model_key(mo.path) },
+                     { "spares", a.get_int("--spares", "", 1) }, { "ttl_s", a.get_int("--token-ttl", "", 3600) } };
+        if (a.has("--city")) {
+            req["city"] = a.get("--city", "", "");
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const http_reply r = coord_post(a.get("--coordinator", "", ""), "/v1/chains", req);
+        if (r.status != 200) {
+            throw std::runtime_error("the coordinator gave no chain: " + r.error());
+        }
+        auto refs_of = [](const json & arr) {
+            std::vector<node_ref> out;
+            for (const auto & n : arr) {
+                out.push_back({ n.at("addr").get<std::string>(), "", n.at("token").get<std::string>(), n.at("pin").get<std::string>() });
+            }
+            return out;
+        };
+        coord_nodes   = refs_of(r.body.at("nodes"));
+        coord_spares  = refs_of(r.body.at("spares"));
+        coord_session = std::stoull(r.body.at("session").get<std::string>(), nullptr, 16);
+        for (const auto & n : coord_nodes) {
+            addrs.push_back(n.addr);
+        }
+        AN_LOG("coordinator: chain of %zu nodes and %zu spares for session %s in %.0f ms (%d layer ranges without a spare)\n",
+            coord_nodes.size(), coord_spares.size(), r.body.at("session").get<std::string>().c_str(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+            r.body.value("stages_without_spare", 0));
+    }
 
     const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
 
@@ -1584,16 +1652,23 @@ static int cmd_client(const cli_args & a) {
     }
 
     chain_opts co;
-    co.nodes      = refs(addrs, "--");
-    co.spares     = refs(spare_addrs, "--spare-");
-    co.tls        = a.has("--tls");
+    if (a.has("--coordinator")) {
+        co.nodes   = coord_nodes;
+        co.spares  = coord_spares;
+        co.session = coord_session;
+        co.tls     = true;
+    } else {
+        co.nodes  = refs(addrs, "--");
+        co.spares = refs(spare_addrs, "--spare-");
+        co.tls    = a.has("--tls");
+    }
     co.timeout_ms = a.get_int("--timeout", "", 3000);
     co.n_ctx      = g.n_ctx;
     co.n_top      = g.n_top;
     co.hidden     = g.hidden;
     co.n_rollback = dm ? (uint32_t) n_draft : 0;
     co.token_ttl  = (uint64_t) a.get_int("--token-ttl", "", 3600);
-    if (a.has("--session")) {
+    if (a.has("--session") && !a.has("--coordinator")) {
         co.session = std::stoull(a.get("--session", "", ""), nullptr, 16);
     }
     chain_eval chain(co);
@@ -1764,6 +1839,45 @@ static int cmd_token(const cli_args & a) {
 
 // prints the shape of the model as one JSON line, for the scripts that split it into layer ranges
 // reads only the GGUF metadata, no weights
+// identity of the model file for the coordinator, the same for a node and for the client (which loads only the vocabulary,
+// so llama_model_desc is not known there): name and shape from the GGUF metadata plus a hash of the tensor names, types
+// and sizes, which differs between quantizations; reads only the metadata
+static std::string model_key(const std::string & path) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        throw std::runtime_error("cannot read the GGUF metadata of " + path);
+    }
+    auto get_str = [&](const std::string & key) -> std::string {
+        const int64_t id = gguf_find_key(g, key.c_str());
+        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id) : "";
+    };
+    auto get_u32 = [&](const std::string & key) -> long long {
+        const int64_t id = gguf_find_key(g, key.c_str());
+        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? (long long) gguf_get_val_u32(g, id) : -1;
+    };
+    uint64_t h = 1469598103934665603ull; // FNV-1a
+    auto mix = [&](const void * p, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            h = (h ^ ((const uint8_t *) p)[i]) * 1099511628211ull;
+        }
+    };
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        const char *   name = gguf_get_tensor_name(g, i);
+        const int32_t  type = (int32_t) gguf_get_tensor_type(g, i);
+        const uint64_t size = (uint64_t) gguf_get_tensor_size(g, i);
+        mix(name, strlen(name) + 1);
+        mix(&type, sizeof(type));
+        mix(&size, sizeof(size));
+    }
+    const std::string arch = get_str("general.architecture");
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s %s L%lld E%lld #%016llx", arch.c_str(), get_str("general.name").c_str(),
+        get_u32(arch + ".block_count"), get_u32(arch + ".embedding_length"), (unsigned long long) h);
+    gguf_free(g);
+    return buf;
+}
+
 static int cmd_info(const cli_args & a) {
     const std::string path = a.get("-m", "--model", "");
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
@@ -1780,8 +1894,9 @@ static int cmd_info(const cli_args & a) {
         return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? (long long) gguf_get_val_u32(g, id) : -1;
     };
     const std::string arch = get_str("general.architecture");
-    printf("{\"arch\":\"%s\",\"n_layer\":%lld,\"n_embd\":%lld,\"full_attention_interval\":%lld}\n", arch.c_str(),
-        get_u32(arch + ".block_count"), get_u32(arch + ".embedding_length"), get_u32(arch + ".full_attention_interval"));
+    printf("{\"arch\":\"%s\",\"n_layer\":%lld,\"n_embd\":%lld,\"full_attention_interval\":%lld,\"model_key\":%s}\n", arch.c_str(),
+        get_u32(arch + ".block_count"), get_u32(arch + ".embedding_length"), get_u32(arch + ".full_attention_interval"),
+        json(model_key(path)).dump().c_str());
     gguf_free(g);
     return 0;
 }
@@ -1804,6 +1919,8 @@ static void usage() {
         "security: node [--key HEX | env AGENT_NODE_KEY] [--tls --identity node.pem]\n"
         "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
         "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
+        "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
+        "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
         "\n"
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
 }

@@ -71,14 +71,23 @@ inline std::string random_key_hex(size_t n = 32) {
     return to_hex(b.data(), n);
 }
 
-inline std::string token_mac(const std::vector<uint8_t> & key, uint64_t session, uint64_t expiry) {
-    const std::string m = "agent-node/1|" + session_hex(session) + "|" + std::to_string(expiry);
+inline std::string hmac_hex(const std::vector<uint8_t> & key, const std::string & m) {
     uint8_t md[EVP_MAX_MD_SIZE];
     unsigned int n = 0;
     if (HMAC(EVP_sha256(), key.data(), (int) key.size(), (const uint8_t *) m.data(), m.size(), md, &n) == nullptr) {
         throw std::runtime_error("HMAC failed");
     }
     return to_hex(md, n);
+}
+
+inline std::string token_mac(const std::vector<uint8_t> & key, uint64_t session, uint64_t expiry) {
+    return hmac_hex(key, "agent-node/1|" + session_hex(session) + "|" + std::to_string(expiry));
+}
+
+// signature of a request of the node to the coordinator (heartbeat): "<expiry>:<hex HMAC(key, "agent-coord/1|<node id>|<expiry>")>"
+inline std::string node_signature(const std::vector<uint8_t> & key, const std::string & node_id, uint64_t ttl_s) {
+    const uint64_t expiry = unix_now() + ttl_s;
+    return std::to_string(expiry) + ":" + hmac_hex(key, "agent-coord/1|" + node_id + "|" + std::to_string(expiry));
 }
 
 inline std::string token_issue(const std::string & key_hex, uint64_t session, uint64_t ttl_s) {
