@@ -315,13 +315,15 @@ struct model_part {
                 const bool out = !is_last() || out_all || i + 1 == h.n_tokens;
                 batch.add(ids[i], h.pos0 + (int32_t) i, 0, out);
             }
-        } else if (h.kind == payload::f16 || h.kind == payload::f32) {
+        } else if (h.kind == payload::f16 || h.kind == payload::f32 || h.kind == payload::q8) {
             if (is_first()) {
                 throw std::runtime_error("the first node takes tokens, not hidden states");
             }
             hidden_in.resize((size_t) h.n_tokens * n_embd);
             if (h.kind == payload::f16) {
                 ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, hidden_in.data(), (int64_t) hidden_in.size());
+            } else if (h.kind == payload::q8) {
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(data, hidden_in.data(), (int64_t) hidden_in.size());
             } else {
                 memcpy(hidden_in.data(), data, hidden_in.size() * sizeof(float));
             }
@@ -448,8 +450,11 @@ struct node_server {
         auto s = std::make_shared<session>();
         s->id    = m.session;
         s->n_top = std::clamp<uint32_t>(m.n_top, 1, 256);
-        if (m.hidden != payload::f16 && m.hidden != payload::f32) {
-            throw std::runtime_error("hidden states must be f16 or f32");
+        if (m.hidden != payload::f16 && m.hidden != payload::f32 && m.hidden != payload::q8) {
+            throw std::runtime_error("hidden states must be f16, f32 or q8");
+        }
+        if (m.hidden == payload::q8 && llama_model_n_embd(model.get()) % Q8_BLOCK != 0) {
+            throw std::runtime_error("q8 hidden states need n_embd divisible by 32");
         }
         s->hidden = m.hidden;
         s->owner = conn;
@@ -530,6 +535,10 @@ struct node_server {
             out.write(w);
             if (s->hidden == payload::f32) {
                 w.put_bytes(hidden.data(), hidden.size() * sizeof(float));
+            } else if (s->hidden == payload::q8) {
+                // rows are whole blocks (n_embd % 32 == 0), so the rows can be quantized as one run
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->from_float_ref(hidden.data(),
+                    w.grow(payload_size(payload::q8, out.n_tokens, p.n_embd)), (int64_t) hidden.size());
             } else {
                 ggml_fp32_to_fp16_row(hidden.data(), (ggml_fp16_t *) w.grow(hidden.size() * 2), (int64_t) hidden.size());
             }
@@ -649,6 +658,29 @@ struct node_server {
     }
 };
 
+// a quick measurement of the speed of this node for the coordinator: single-token forwards through the layers of the part,
+// as in generation; returns milliseconds per layer per token
+static double measure_ms_per_layer(const llama_model * model, const model_opts & mo, int32_t n_threads) {
+    model_part p(model, mo, 64, n_threads);
+    std::vector<float> in((size_t) p.n_embd, 0.01f), hidden;
+    std::vector<top_entry> top;
+    uint32_t n_out = 0;
+    const int n_warm = 3, n_run = 16;
+    double t0 = 0;
+    for (int i = 0; i < n_warm + n_run; i++) {
+        if (i == n_warm) {
+            t0 = now_ms();
+        }
+        forward_hdr h;
+        h.pos0     = i;
+        h.n_tokens = 1;
+        h.kind     = p.is_first() ? payload::tokens : payload::f32;
+        const int32_t tok = 1;
+        p.run(h, p.is_first() ? (const uint8_t *) &tok : (const uint8_t *) in.data(), hidden, top, 8, n_out);
+    }
+    return (now_ms() - t0) / n_run / std::max(1, p.last - p.first);
+}
+
 static std::string model_key(const std::string & path);
 
 static int cmd_node(const cli_args & a) {
@@ -702,6 +734,13 @@ static int cmd_node(const cli_args & a) {
             first, last, n_layer, host.c_str(), port);
     }
 
+    // for the coordinator, which prefers fast nodes; before the ready line, so that a measurement does not meet clients
+    double ms_per_layer = 0;
+    if (a.has("--coordinator")) {
+        ms_per_layer = measure_ms_per_layer(srv.model.get(), srv.mo, srv.n_threads);
+        AN_LOG("node: %.3f ms per layer per token\n", ms_per_layer);
+    }
+
     tcp_listener ln(host, port);
     // the scripts wait for this line
     printf("agent-node ready on %s:%d%s%s\n", host.c_str(), port, fingerprint.empty() ? "" : " tls ", fingerprint.c_str());
@@ -720,6 +759,7 @@ static int cmd_node(const cli_args & a) {
         link.url  = a.get("--coordinator", "", "");
         link.key  = srv.key;
         link.reg  = json{
+            { "ms_per_layer", ms_per_layer },
             { "addr", pub },
             { "tls_fingerprint", fingerprint },
             { "node_key", key_hex },
@@ -1236,10 +1276,10 @@ static gen_opts gen_opts_from(const cli_args & a) {
         }
     }
     const std::string hidden = a.get("--hidden", "", "f16");
-    if (hidden != "f16" && hidden != "f32") {
-        throw std::runtime_error("--hidden must be f16 or f32");
+    if (hidden != "f16" && hidden != "f32" && hidden != "q8") {
+        throw std::runtime_error("--hidden must be f16, f32 or q8");
     }
-    g.hidden = hidden == "f32" ? payload::f32 : payload::f16;
+    g.hidden = hidden == "f32" ? payload::f32 : hidden == "q8" ? payload::q8 : payload::f16;
     return g;
 }
 
@@ -1907,7 +1947,7 @@ static void usage() {
         "  agent-node node      -m model.gguf --layers START:END [--host 127.0.0.1] [--port 50152] [-ngl 999] [--device CUDA0] [-t N]\n"
         "  agent-node client    -m model.gguf --chain HOST:PORT,HOST:PORT,... [-p TEXT | -f FILE] [-n 64] [-c 4096]\n"
         "                       [--top 8] [--ignore-eos] [--no-chat] [--dump FILE] [--json FILE]\n"
-        "                       [--hidden f16|f32] [--force REFERENCE_DUMP]\n"
+        "                       [--hidden f16|f32|q8] [--force REFERENCE_DUMP]\n"
         "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]]   speculative decoding\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"

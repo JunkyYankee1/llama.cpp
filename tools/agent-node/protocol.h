@@ -37,13 +37,18 @@ enum class payload : uint8_t {
     tokens = 0, // int32 token ids
     f16    = 1, // fp16 hidden states, n_tokens rows of n_embd
     f32    = 2, // fp32 hidden states: exact, twice the traffic, for checks
+    q8     = 3, // int8 hidden states as ggml Q8_0 blocks: an fp16 scale per 32 values, 34 bytes per 32 (n_embd % 32 == 0)
 };
+
+constexpr int32_t Q8_BLOCK       = 32;
+constexpr size_t  Q8_BLOCK_BYTES = 34;
 
 inline size_t payload_size(payload kind, uint32_t n_tokens, int32_t n_embd) {
     switch (kind) {
         case payload::tokens: return (size_t) n_tokens * 4;
         case payload::f16:    return (size_t) n_tokens * n_embd * 2;
         case payload::f32:    return (size_t) n_tokens * n_embd * 4;
+        case payload::q8:     return (size_t) n_tokens * (n_embd / Q8_BLOCK) * Q8_BLOCK_BYTES;
     }
     throw std::runtime_error("unknown payload kind " + std::to_string((int) kind));
 }
