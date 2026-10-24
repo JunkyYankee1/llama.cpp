@@ -9,6 +9,7 @@
 // the last node sends the top-k logits back to the client: one transfer per node per token
 
 #include "protocol.h"
+#include "secure.h"
 
 #ifdef _WIN32
 #    include <windows.h>
@@ -31,7 +32,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
+#include <deque>
+#include <condition_variable>
+#include <set>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -62,7 +67,7 @@ struct cli_args {
     std::vector<std::string>           positional;
 
     static bool is_flag(const std::string & name) {
-        return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "-v" || name == "--verbose";
+        return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -88,6 +93,8 @@ struct cli_args {
             "--chain", "--ctx-size", "--device", "--draft", "--draft-max", "--draft-ngl", "--draft-noise", "--dump", "--file",
             "--force", "--hidden", "--host", "--ignore-eos", "--json", "--layers", "--model", "--n-gpu-layers", "--n-predict",
             "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
+            "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
+            "--token-ttl", "--key", "--identity", "--ttl",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -381,6 +388,23 @@ struct node_server {
     int32_t         n_threads = 4;
     uint32_t        max_sessions = 4;
 
+    std::vector<uint8_t> key;                 // secret key: open and attach need an access token; empty: open node (tests)
+    void *               server_ctx = nullptr; // SSL_CTX of incoming connections, null: plain TCP
+    void *               client_ctx = nullptr; // SSL_CTX of the connection to the next node
+
+    // "" when the token gives access to the session
+    std::string check_token(uint64_t session, const std::string & token) const {
+        if (key.empty()) {
+            return "";
+        }
+#ifdef AGENT_HAVE_TLS
+        return token_check(key, session, token);
+#else
+        (void) session; (void) token;
+        return "access tokens need a build with OpenSSL or BoringSSL";
+#endif
+    }
+
     std::mutex                                     mtx;
     std::map<uint64_t, std::shared_ptr<session>>   sessions;
 
@@ -393,14 +417,23 @@ struct node_server {
         return it->second;
     }
 
-    void on_open(const tcp_conn_ptr & conn, reader & r) {
+    void on_open(const tcp_conn_ptr & conn, reader & r, std::set<uint64_t> & authed) {
         const open_msg m = open_msg::read(r);
         if (m.version != PROTOCOL_VERSION) {
             throw std::runtime_error("protocol version " + std::to_string(m.version) + ", this node speaks " + std::to_string(PROTOCOL_VERSION));
         }
+        if (const std::string err = check_token(m.session, m.token); !err.empty()) {
+            throw std::runtime_error("access denied: " + err);
+        }
         {
             std::lock_guard<std::mutex> lock(mtx);
-            if (sessions.count(m.session)) {
+            auto it = sessions.find(m.session);
+            // the client reopens a session after a failure: the connection of the old one may not be noticed as closed yet
+            if (it != sessions.end() && it->second->owner->is_closed()) {
+                sessions.erase(it);
+                it = sessions.end();
+            }
+            if (it != sessions.end()) {
                 throw std::runtime_error("session already open");
             }
             if (sessions.size() >= max_sessions) {
@@ -422,10 +455,11 @@ struct node_server {
                                                         : "this node does not run the last layers, it needs a next node");
         }
         if (!m.next.empty()) {
-            s->next = tcp_connect(m.next);
-            writer w;
-            w.put(m.session);
-            if (!send_frame(*s->next, msg::attach, w)) {
+            s->next = secure_connect(m.next, client_ctx, m.next_pin);
+            attach_msg am;
+            am.session = m.session;
+            am.token   = m.next_token;
+            if (!send_frame(*s->next, msg::attach, am.write())) {
                 throw std::runtime_error("cannot attach to the next node " + m.next);
             }
             // errors of the next node go back to the client
@@ -455,6 +489,7 @@ struct node_server {
             std::lock_guard<std::mutex> lock(mtx);
             sessions[m.session] = s;
         }
+        authed.insert(m.session);
         AN_LOG("session %" PRIu64 ": layers [%d, %d), n_ctx = %u, next = %s\n",
             m.session, ok.layer_start, ok.layer_end, m.n_ctx, m.next.empty() ? "(client)" : m.next.c_str());
         send_frame(*conn, msg::open_ok, ok.write());
@@ -528,6 +563,23 @@ struct node_server {
     }
 
     void serve(tcp_conn_ptr conn) {
+#ifdef AGENT_HAVE_TLS
+        if (server_ctx) {
+            const std::string err = conn->tls_handshake((SSL_CTX *) server_ctx, true);
+            if (!err.empty()) {
+                AN_LOG("error: %s\n", err.c_str());
+                return;
+            }
+        }
+#endif
+        // sessions this connection may use: opened by it, or attached to with a valid token
+        std::set<uint64_t> authed;
+        auto require = [&](uint64_t session) {
+            if (!key.empty() && !authed.count(session)) {
+                throw std::runtime_error("access denied: session " + std::to_string(session) + " was not opened or attached on this connection");
+            }
+        };
+
         msg type;
         std::vector<uint8_t> body;
         try {
@@ -535,11 +587,34 @@ struct node_server {
                 try {
                     reader r(body.data(), body.size());
                     switch (type) {
-                        case msg::open:    on_open(conn, r); break;
-                        case msg::attach:  break; // the previous node: forward frames follow
-                        case msg::forward: on_forward(body); break;
+                        case msg::open:    on_open(conn, r, authed); break;
+                        case msg::attach: {
+                            // the previous node: forward frames follow
+                            const attach_msg am = attach_msg::read(r);
+                            if (const std::string err = check_token(am.session, am.token); !err.empty()) {
+                                throw std::runtime_error("access denied: " + err);
+                            }
+                            authed.insert(am.session);
+                        } break;
+                        case msg::forward: {
+                            reader rh(body.data(), body.size());
+                            require(rh.get<uint64_t>());
+                            on_forward(body);
+                        } break;
+                        case msg::hello: {
+                            hello_ok_msg h;
+                            h.n_layer     = llama_model_n_layer(model.get());
+                            h.layer_start = std::clamp(mo.layer_start, 0, h.n_layer);
+                            h.layer_end   = mo.layer_end <= 0 ? h.n_layer : std::min(mo.layer_end, h.n_layer);
+                            h.tls         = server_ctx != nullptr;
+                            h.auth        = !key.empty();
+                            h.desc        = model_desc(model.get());
+                            send_frame(*conn, msg::hello_ok, h.write());
+                        } break;
                         case msg::stats: {
-                            auto s = find(r.get<uint64_t>());
+                            const uint64_t id = r.get<uint64_t>();
+                            require(id);
+                            auto s = find(id);
                             stats_msg st;
                             {
                                 std::lock_guard<std::mutex> lock(s->mtx);
@@ -549,6 +624,7 @@ struct node_server {
                         } break;
                         case msg::close: {
                             const uint64_t id = r.get<uint64_t>();
+                            require(id);
                             std::lock_guard<std::mutex> lock(mtx);
                             sessions.erase(id);
                         } break;
@@ -563,6 +639,7 @@ struct node_server {
         } catch (const std::exception & e) {
             AN_LOG("error: " "connection: %s\n", e.what());
         }
+        conn->close();
         drop_owned_by(conn);
     }
 };
@@ -575,6 +652,40 @@ static int cmd_node(const cli_args & a) {
     const std::string host = a.get("--host", "", "127.0.0.1");
     const int         port = a.get_int("--port", "", 50152);
 
+    // access: the secret key of this node (the coordinator issues tokens with it)
+    std::string key_hex = a.get("--key", "", "");
+    if (key_hex.empty()) {
+        if (const char * env = getenv("AGENT_NODE_KEY")) {
+            key_hex = env;
+        }
+    }
+    if (!key_hex.empty()) {
+        require_tls("--key");
+        srv.key = from_hex(key_hex);
+        if (srv.key.size() < 16) {
+            throw std::runtime_error("--key must have at least 16 bytes (32 hex digits)");
+        }
+    } else {
+        AN_LOG("warning: no --key, the node accepts sessions without access tokens\n");
+    }
+    std::string fingerprint;
+#ifdef AGENT_HAVE_TLS
+    tls_identity identity;
+    if (a.has("--tls")) {
+        identity.load_or_create(a.get("--identity", "", ""));
+        fingerprint      = identity.fingerprint();
+        srv.server_ctx   = tls_server_ctx(identity);
+        srv.client_ctx   = tls_client_ctx();
+    }
+#else
+    if (a.has("--tls")) {
+        require_tls("--tls");
+    }
+#endif
+    if (!a.has("--tls")) {
+        AN_LOG("warning: no --tls, the traffic of the node is not encrypted\n");
+    }
+
     srv.model = load_model(srv.mo);
     {
         const int32_t n_layer = llama_model_n_layer(srv.model.get());
@@ -586,7 +697,7 @@ static int cmd_node(const cli_args & a) {
 
     tcp_listener ln(host, port);
     // the scripts wait for this line
-    printf("agent-node ready on %s:%d\n", host.c_str(), port);
+    printf("agent-node ready on %s:%d%s%s\n", host.c_str(), port, fingerprint.empty() ? "" : " tls ", fingerprint.c_str());
     fflush(stdout);
 
     while (true) {
@@ -608,34 +719,178 @@ struct evaluator {
     virtual std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) = 0;
 };
 
-struct chain_eval : evaluator {
-    std::vector<std::string>  addrs;
-    std::vector<tcp_conn_ptr> conns;
-    std::vector<open_ok_msg>  parts;
-    uint64_t                  sid = 0;
-    uint32_t                  step = 0;
-    uint32_t                  n_top = 8;
+// one node of the chain as the client knows it
+struct node_ref {
+    std::string addr;
+    std::string key;   // secret key of the node, to issue tokens itself (tests; normally the coordinator issues them)
+    std::string token; // access token issued by the coordinator for the session
+    std::string pin;   // expected certificate fingerprint ("" = not checked)
+};
 
-    chain_eval(const std::vector<std::string> & addrs, uint32_t n_ctx, uint32_t n_top, payload hidden, uint32_t n_rollback = 0)
-        : addrs(addrs), n_top(n_top) {
-        std::random_device rd;
-        sid = ((uint64_t) rd() << 32) | rd();
+struct chain_opts {
+    std::vector<node_ref> nodes;
+    std::vector<node_ref> spares;   // nodes that can replace a failed node of the same layer range
+    bool     tls            = false;
+    int      timeout_ms     = 3000;  // a node that does not answer in time counts as failed (plus 20 ms per token of a batch)
+    uint32_t n_ctx          = 4096;
+    uint32_t n_top          = 8;
+    payload  hidden         = payload::f16;
+    uint32_t n_rollback     = 0;
+    uint64_t session        = 0;    // 0: chosen by the client
+    uint64_t token_ttl      = 3600;
+    int      max_recoveries = 5;
+};
 
-        for (const auto & ad : addrs) {
-            conns.push_back(tcp_connect(ad));
+// a node failed: closed connection, error or timeout; the chain can be rebuilt
+struct chain_failure : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// frames from all nodes, read by one thread per connection
+struct chain_events {
+    struct event {
+        uint64_t             gen;
+        size_t               node;
+        msg                  type;
+        std::vector<uint8_t> body;
+        bool                 closed;
+    };
+    std::mutex              m;
+    std::condition_variable cv;
+    std::deque<event>       q;
+
+    void push(event && e) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            q.push_back(std::move(e));
         }
-        parts.resize(addrs.size());
-        // open from the last node, so that every node can attach to an open session of the next one
-        for (size_t i = addrs.size(); i-- > 0;) {
-            open_msg m;
-            m.session = sid;
-            m.n_ctx   = n_ctx;
-            m.n_top   = n_top;
-            m.next    = i + 1 < addrs.size() ? addrs[i + 1] : "";
-            m.hidden  = hidden;
-            m.n_rollback = n_rollback;
-            send_frame(*conns[i], msg::open, m.write());
+        cv.notify_all();
+    }
+};
 
+struct chain_eval : evaluator {
+    chain_opts                    o;
+    std::vector<node_ref>         cur;   // the nodes of the chain now (failed ones replaced by spares)
+    std::vector<std::string>      addrs;
+    std::vector<tcp_conn_ptr>     conns;
+    std::vector<open_ok_msg>      parts;
+    uint64_t                      sid  = 0;
+    uint32_t                      step = 0;
+    uint32_t                      n_top = 8;
+    std::vector<llama_token>      hist;  // the tokens in the memory of the chain, by position
+    std::shared_ptr<chain_events> ev = std::make_shared<chain_events>();
+    uint64_t                      gen = 0; // connections of older generations are ignored
+    void *                        cctx = nullptr;
+
+    int    n_recoveries = 0;
+    double recover_ms   = 0;     // total pause of the generation for recoveries
+    double recover_max_ms = 0;
+
+    explicit chain_eval(const chain_opts & opts) : o(opts), cur(opts.nodes), n_top(opts.n_top) {
+#ifdef AGENT_HAVE_TLS
+        if (o.tls) {
+            cctx = tls_client_ctx();
+        }
+#else
+        if (o.tls) {
+            require_tls("--tls");
+        }
+#endif
+        sid = o.session ? o.session : random_session();
+        open_chain();
+    }
+
+    ~chain_eval() override {
+        close_chain(true);
+#ifdef AGENT_HAVE_TLS
+        if (cctx) {
+            SSL_CTX_free((SSL_CTX *) cctx);
+        }
+#endif
+    }
+
+    static uint64_t random_session() {
+        std::random_device rd;
+        return ((uint64_t) rd() << 32) | rd();
+    }
+
+    std::string token_for(const node_ref & n) const {
+        if (!n.token.empty()) {
+            return n.token;
+        }
+        if (!n.key.empty()) {
+#ifdef AGENT_HAVE_TLS
+            return token_issue(n.key, sid, o.token_ttl);
+#else
+            require_tls("--keys");
+#endif
+        }
+        return "";
+    }
+
+    // tokens issued by the coordinator are bound to the session: then a recovery keeps the session id
+    bool can_issue_tokens() const {
+        for (const auto & v : { o.nodes, o.spares }) {
+            for (const auto & n : v) {
+                if (!n.token.empty()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void start_reader(size_t i, const tcp_conn_ptr & c) {
+        std::thread([events = ev, c, i, g = gen]() {
+            msg type;
+            std::vector<uint8_t> body;
+            try {
+                while (recv_frame(*c, type, body)) {
+                    events->push({ g, i, type, body, false });
+                }
+            } catch (const std::exception &) {
+            }
+            events->push({ g, i, msg::error, {}, true });
+        }).detach();
+    }
+
+    void open_chain() {
+        {
+            std::lock_guard<std::mutex> lock(ev->m);
+            ev->q.clear();
+        }
+        gen++;
+        conns.clear();
+        addrs.clear();
+        for (const auto & n : cur) {
+            addrs.push_back(n.addr);
+            tcp_conn_ptr c;
+            try {
+                c = secure_connect(n.addr, cctx, n.pin);
+            } catch (const std::exception & e) {
+                throw chain_failure(e.what());
+            }
+            conns.push_back(c);
+            start_reader(conns.size() - 1, c);
+        }
+        parts.assign(cur.size(), {});
+        // open from the last node, so that every node can attach to an open session of the next one
+        for (size_t i = cur.size(); i-- > 0;) {
+            open_msg m;
+            m.session    = sid;
+            m.n_ctx      = o.n_ctx;
+            m.n_top      = o.n_top;
+            m.hidden     = o.hidden;
+            m.n_rollback = o.n_rollback;
+            m.token      = token_for(cur[i]);
+            if (i + 1 < cur.size()) {
+                m.next       = cur[i + 1].addr;
+                m.next_token = token_for(cur[i + 1]);
+                m.next_pin   = cur[i + 1].pin;
+            }
+            if (!send_frame(*conns[i], msg::open, m.write())) {
+                throw chain_failure("node " + addrs[i] + " closed the connection");
+            }
             std::vector<uint8_t> body = expect(i, msg::open_ok);
             reader r(body.data(), body.size());
             parts[i] = open_ok_msg::read(r);
@@ -643,7 +898,8 @@ struct chain_eval : evaluator {
 
         for (size_t i = 0; i < parts.size(); i++) {
             const auto & p = parts[i];
-            AN_LOG("node %zu (%s): layers [%d, %d) of %d\n", i, addrs[i].c_str(), p.layer_start, p.layer_end, p.n_layer);
+            AN_LOG("node %zu (%s): layers [%d, %d) of %d%s\n", i, addrs[i].c_str(), p.layer_start, p.layer_end, p.n_layer,
+                conns[i]->is_tls() ? ", TLS" : "");
             const int32_t want_start = i == 0 ? 0 : parts[i - 1].layer_end;
             if (p.layer_start != want_start || p.desc != parts[0].desc || p.n_layer != parts[0].n_layer) {
                 throw std::runtime_error("node " + addrs[i] + " does not continue the chain: layers [" +
@@ -655,31 +911,61 @@ struct chain_eval : evaluator {
         }
     }
 
-    ~chain_eval() override {
+    void close_chain(bool polite) {
         for (auto & c : conns) {
-            writer w;
-            w.put(sid);
-            send_frame(*c, msg::close, w);
+            if (polite) {
+                writer w;
+                w.put(sid);
+                send_frame(*c, msg::close, w);
+            }
+            c->close();
+        }
+        conns.clear();
+        gen++;
+    }
+
+    // waits for frame `want` from node i; an error or a closed connection of any node is a failure of the chain
+    std::vector<uint8_t> expect(size_t i, msg want, int extra_ms = 0) {
+        const int  wait_ms  = o.timeout_ms + extra_ms;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+        std::unique_lock<std::mutex> lock(ev->m);
+        while (true) {
+            while (!ev->q.empty()) {
+                chain_events::event e = std::move(ev->q.front());
+                ev->q.pop_front();
+                if (e.gen != gen) {
+                    continue;
+                }
+                const std::string who = "node " + addrs[e.node];
+                if (e.closed) {
+                    throw chain_failure(who + " closed the connection");
+                }
+                if (e.type == msg::error) {
+                    reader r(e.body.data(), e.body.size());
+                    const std::string text = r.get_str();
+                    // a refused access or a wrong chain cannot be fixed by a spare node
+                    if (text.rfind("access denied", 0) == 0 || text.find("does not continue") != std::string::npos) {
+                        throw std::runtime_error(who + ": " + text);
+                    }
+                    throw chain_failure(who + ": " + text);
+                }
+                if (e.node == i && e.type == want) {
+                    return std::move(e.body);
+                }
+            }
+            if (ev->cv.wait_until(lock, deadline) == std::cv_status::timeout && ev->q.empty()) {
+                throw chain_failure("node " + addrs[i] + " did not answer in " + std::to_string(wait_ms) + " ms");
+            }
         }
     }
 
-    std::vector<uint8_t> expect(size_t i, msg want) {
-        msg type;
-        std::vector<uint8_t> body;
-        if (!recv_frame(*conns[i], type, body)) {
-            throw std::runtime_error("node " + addrs[i] + " closed the connection");
+    std::vector<top_entry> eval_once(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all) {
+        if ((size_t) pos0 > hist.size()) {
+            throw std::runtime_error("forward leaves a gap in the context");
         }
-        if (type == msg::error) {
-            reader r(body.data(), body.size());
-            throw std::runtime_error("node " + addrs[i] + ": " + r.get_str());
-        }
-        if (type != want) {
-            throw std::runtime_error("node " + addrs[i] + ": unexpected frame " + std::to_string((int) type));
-        }
-        return body;
-    }
+        hist.resize(pos0);
+        hist.insert(hist.end(), tokens, tokens + n);
 
-    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) override {
         forward_hdr h;
         h.session  = sid;
         h.step     = ++step;
@@ -691,10 +977,10 @@ struct chain_eval : evaluator {
         h.write(w);
         w.put_bytes(tokens, (size_t) n * sizeof(llama_token));
         if (!send_frame(*conns[0], msg::forward, w)) {
-            throw std::runtime_error("node " + addrs[0] + " closed the connection");
+            throw chain_failure("node " + addrs[0] + " closed the connection");
         }
 
-        std::vector<uint8_t> body = expect(conns.size() - 1, msg::result);
+        std::vector<uint8_t> body = expect(conns.size() - 1, msg::result, 20 * (int) n);
         reader r(body.data(), body.size());
         result_msg res = result_msg::read(r);
         if (res.step != step || res.n_out != (out_all ? n : 1)) {
@@ -704,6 +990,110 @@ struct chain_eval : evaluator {
             return res.top;
         }
         return std::vector<top_entry>(res.top.end() - res.n_top, res.top.end());
+    }
+
+    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) override {
+        while (true) {
+            try {
+                return eval_once(tokens, n, pos0, out_all);
+            } catch (const chain_failure & e) {
+                if (n_recoveries >= o.max_recoveries) {
+                    throw std::runtime_error(std::string("the chain failed again: ") + e.what());
+                }
+                recover(pos0, e.what());
+            }
+        }
+    }
+
+    // is the node alive and does it run these layers
+    bool probe(const node_ref & n, int32_t layer_start, int32_t layer_end, const std::string & desc) {
+        try {
+            tcp_conn_ptr c = secure_connect(n.addr, cctx, n.pin, 1000);
+            c->recv_timeout_ms = 1000;
+            if (!send_frame(*c, msg::hello, writer())) {
+                return false;
+            }
+            msg type;
+            std::vector<uint8_t> body;
+            if (!recv_frame(*c, type, body) || type != msg::hello_ok) {
+                return false;
+            }
+            reader r(body.data(), body.size());
+            const hello_ok_msg h = hello_ok_msg::read(r);
+            c->close();
+            return h.layer_start == layer_start && h.layer_end == layer_end && h.desc == desc;
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
+    // rebuilds the chain after a failure: dead nodes are replaced by spares of the same layers,
+    // then the context before pos0 is read again in batches
+    void recover(int32_t pos0, const std::string & why) {
+        const double t0 = now_ms();
+        n_recoveries++;
+        AN_LOG("chain failure: %s - recovering\n", why.c_str());
+
+        const std::vector<open_ok_msg> old_parts = parts;
+        close_chain(false);
+
+        for (int attempt = 0;; attempt++) {
+            std::set<std::string> in_use;
+            for (const auto & n : cur) {
+                in_use.insert(n.addr);
+            }
+            // all nodes are checked at once: a hung node costs one probe timeout, not one per node
+            std::vector<std::future<bool>> alive;
+            for (size_t i = 0; i < cur.size(); i++) {
+                const auto & p = old_parts[i];
+                alive.push_back(std::async(std::launch::async, [this, n = cur[i], p]() { return probe(n, p.layer_start, p.layer_end, p.desc); }));
+            }
+            for (size_t i = 0; i < cur.size(); i++) {
+                const auto & p = old_parts[i];
+                if (alive[i].get()) {
+                    continue;
+                }
+                bool replaced = false;
+                for (const auto & sp : o.spares) {
+                    if (!in_use.count(sp.addr) && probe(sp, p.layer_start, p.layer_end, p.desc)) {
+                        AN_LOG("node %zu (%s) is down, replaced by %s\n", i, cur[i].addr.c_str(), sp.addr.c_str());
+                        cur[i] = sp;
+                        in_use.insert(sp.addr);
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    throw std::runtime_error("node " + cur[i].addr + " failed (" + why + ") and no spare node runs layers [" +
+                        std::to_string(p.layer_start) + ", " + std::to_string(p.layer_end) + ")");
+                }
+            }
+            if (can_issue_tokens()) {
+                sid = random_session();
+            }
+            try {
+                open_chain();
+                break;
+            } catch (const chain_failure & e) {
+                close_chain(false);
+                if (attempt >= 3) {
+                    throw std::runtime_error(std::string("cannot rebuild the chain: ") + e.what());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+
+        // the new nodes read the context again; a failure here is handled by the caller's next attempt
+        const std::vector<llama_token> pre(hist.begin(), hist.begin() + std::min<size_t>(pos0, hist.size()));
+        hist.clear();
+        for (size_t i = 0; i < pre.size(); i += 512) {
+            const uint32_t n = (uint32_t) std::min<size_t>(512, pre.size() - i);
+            eval_once(pre.data() + i, n, (int32_t) i, false);
+        }
+        const double dt = now_ms() - t0;
+        recover_ms    += dt;
+        recover_max_ms = std::max(recover_max_ms, dt);
+        AN_LOG("chain recovered in %.0f ms, %zu tokens of context read again\n", dt, pre.size());
     }
 
     std::vector<stats_msg> stats() {
@@ -1152,7 +1542,57 @@ static int cmd_client(const cli_args & a) {
         }
     }
 
-    chain_eval chain(addrs, g.n_ctx, g.n_top, g.hidden, dm ? (uint32_t) n_draft : 0);
+    // the nodes: addresses with, aligned by position, secret keys or coordinator tokens and certificate pins
+    auto list = [&](const std::string & name) {
+        std::vector<std::string> out;
+        const std::string v = a.get(name, "", "");
+        if (v.empty()) {
+            return out;
+        }
+        std::stringstream ss(v);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            out.push_back(item);
+        }
+        if (!v.empty() && v.back() == ',') {
+            out.push_back("");
+        }
+        return out;
+    };
+    auto refs = [&](const std::vector<std::string> & ad, const std::string & prefix) {
+        const auto keys = list(prefix + "keys"), tokens = list(prefix + "tokens"), pins = list(prefix + "pins");
+        for (const auto * l : { &keys, &tokens, &pins }) {
+            if (!l->empty() && l->size() != ad.size()) {
+                throw std::runtime_error(prefix + "keys, " + prefix + "tokens and " + prefix + "pins need one entry per node");
+            }
+        }
+        std::vector<node_ref> out;
+        for (size_t i = 0; i < ad.size(); i++) {
+            out.push_back({ ad[i], keys.empty() ? "" : keys[i], tokens.empty() ? "" : tokens[i], pins.empty() ? "" : pins[i] });
+        }
+        return out;
+    };
+    std::vector<std::string> spare_addrs;
+    for (const auto & sa : list("--spare")) {
+        if (!sa.empty()) {
+            spare_addrs.push_back(sa);
+        }
+    }
+
+    chain_opts co;
+    co.nodes      = refs(addrs, "--");
+    co.spares     = refs(spare_addrs, "--spare-");
+    co.tls        = a.has("--tls");
+    co.timeout_ms = a.get_int("--timeout", "", 3000);
+    co.n_ctx      = g.n_ctx;
+    co.n_top      = g.n_top;
+    co.hidden     = g.hidden;
+    co.n_rollback = dm ? (uint32_t) n_draft : 0;
+    co.token_ttl  = (uint64_t) a.get_int("--token-ttl", "", 3600);
+    if (a.has("--session")) {
+        co.session = std::stoull(a.get("--session", "", ""), nullptr, 16);
+    }
+    chain_eval chain(co);
     if (chain.parts[0].n_vocab != llama_vocab_n_tokens(vocab)) {
         throw std::runtime_error("the tokenizer does not match the model of the chain");
     }
@@ -1165,6 +1605,10 @@ static int cmd_client(const cli_args & a) {
     const std::vector<stats_msg> st1 = chain.stats();
 
     print_speed(r);
+    if (chain.n_recoveries > 0) {
+        AN_LOG("recoveries: %d, the longest pause %.0f ms (counters of the nodes restarted)\n", chain.n_recoveries, chain.recover_max_ms);
+        st0.assign(st1.size(), stats_msg());
+    }
 
     // traffic and compute of the timed generation per generated token
     // (with a draft model the nodes also process the rejected draft tokens)
@@ -1176,7 +1620,7 @@ static int cmd_client(const cli_args & a) {
         const double cms = (st1[i].compute_ms - st0[i].compute_ms) / n;
         const double oms = (st1[i].output_ms - st0[i].output_ms) / n;
         AN_LOG("node %zu: %.0f bytes in + %.0f bytes out per token, compute %.2f ms/token (of it reading outputs %.2f)\n", i, in, out, cms, oms);
-        nodes_json << (i ? "," : "") << "{\"addr\":\"" << addrs[i] << "\",\"layer_start\":" << chain.parts[i].layer_start
+        nodes_json << (i ? "," : "") << "{\"addr\":\"" << chain.addrs[i] << "\",\"layer_start\":" << chain.parts[i].layer_start
                    << ",\"layer_end\":" << chain.parts[i].layer_end << ",\"bytes_in_per_token\":" << in
                    << ",\"bytes_out_per_token\":" << out << ",\"compute_ms_per_token\":" << cms
                    << ",\"output_ms_per_token\":" << oms << "}";
@@ -1190,6 +1634,8 @@ static int cmd_client(const cli_args & a) {
           << ",\"pp_tok_s\":" << r.n_prompt * 1000.0 / std::max(r.prefill_ms, 1e-9)
           << ",\"draft_max\":" << (dm ? n_draft : 0) << ",\"n_rounds\":" << r.n_rounds
           << ",\"n_drafted\":" << r.n_drafted << ",\"n_accepted\":" << r.n_accepted << ",\"draft_ms\":" << r.draft_ms << ",\"verify_ms\":" << r.verify_ms
+          << ",\"n_recoveries\":" << chain.n_recoveries << ",\"recover_max_ms\":" << chain.recover_max_ms
+          << ",\"tls\":" << (co.tls ? "true" : "false")
           << ",\"nodes\":[" << nodes_json.str() << "]}\n";
     }
     return 0;
@@ -1270,6 +1716,48 @@ static int cmd_compare(const cli_args & a) {
     return ok ? 0 : 1;
 }
 
+// a new secret key of a node (hex); the coordinator keeps it to issue access tokens
+static int cmd_keygen(const cli_args &) {
+    require_tls("keygen");
+#ifdef AGENT_HAVE_TLS
+    printf("%s\n", random_key_hex().c_str());
+#endif
+    return 0;
+}
+
+// the TLS identity of a node: created if the file does not exist; prints the certificate fingerprint
+static int cmd_identity(const cli_args & a) {
+    require_tls("identity");
+#ifdef AGENT_HAVE_TLS
+    const std::string path = a.get("--identity", "", "");
+    if (path.empty()) {
+        throw std::runtime_error("--identity FILE is required");
+    }
+    tls_identity id;
+    id.load_or_create(path);
+    printf("%s\n", id.fingerprint().c_str());
+#else
+    (void) a;
+#endif
+    return 0;
+}
+
+// an access token for a node and a session, as the coordinator issues it
+static int cmd_token(const cli_args & a) {
+    require_tls("token");
+#ifdef AGENT_HAVE_TLS
+    const std::string key = a.get("--key", "", "");
+    const std::string ses = a.get("--session", "", "");
+    if (key.empty() || ses.empty()) {
+        throw std::runtime_error("--key HEX and --session HEX are required");
+    }
+    printf("%s\n", token_issue(key, std::stoull(ses, nullptr, 16), (uint64_t) a.get_int("--ttl", "", 3600)).c_str());
+#else
+    (void) a;
+#endif
+    return 0;
+}
+
 // prints the shape of the model as one JSON line, for the scripts that split it into layer ranges
 // reads only the GGUF metadata, no weights
 static int cmd_info(const cli_args & a) {
@@ -1305,6 +1793,13 @@ static void usage() {
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
+        "  agent-node keygen                                   a secret key of a node (for access tokens)\n"
+        "  agent-node identity  --identity node.pem            create/read the TLS identity, print its fingerprint\n"
+        "  agent-node token     --key HEX --session HEX [--ttl 3600]\n"
+        "\n"
+        "security: node [--key HEX | env AGENT_NODE_KEY] [--tls --identity node.pem]\n"
+        "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
+        "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
         "\n"
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
 }
@@ -1354,6 +1849,15 @@ int main(int argc, char ** argv) {
         cli_args a(argc, argv, 2);
         if (cmd == "compare") {
             return cmd_compare(a);
+        }
+        if (cmd == "keygen") {
+            return cmd_keygen(a);
+        }
+        if (cmd == "identity") {
+            return cmd_identity(a);
+        }
+        if (cmd == "token") {
+            return cmd_token(a);
         }
         if (cmd == "info") {
             return cmd_info(a);

@@ -61,7 +61,34 @@ Frames are `u32 body size | u8 type | body`, little-endian, see `protocol.h`:
 The client opens the session from the last node to the first one, so that every node can attach to the
 already open session of its next node. The client checks that the layer ranges cover the model without gaps.
 
-Not done yet (see the transport spec of the agent repository): TLS and coordinator tokens, failover with replay
-of the forward history, int8 hidden states.
+## Security
+
+- **Access tokens.** A node started with `--key HEX` (or `AGENT_NODE_KEY`) accepts a session (`open`) and a previous
+  node (`attach`) only with a token `<expiry>:<HMAC-SHA256(key, "agent-node/1|<session>|<expiry>")>`. The coordinator
+  keeps the keys and issues the tokens (`agent-node token`); in tests the client issues them from `--keys`.
+- **TLS 1.3** with `--tls` on all connections, client to node and node to node. Every node has its own key pair and
+  self-signed certificate (`--identity node.pem`, created on first use). The client checks the certificate
+  fingerprints given by `--pins`, and passes the fingerprint of the next node to every node.
+
+```sh
+agent-node keygen                                  # secret key of a node
+agent-node identity --identity n0.pem              # prints the fingerprint
+agent-node node -m model.gguf --layers 0:12 --tls --identity n0.pem --key KEY0
+agent-node client -m model.gguf --chain A,B,C --tls --keys K0,K1,K2 --pins FP0,FP1,FP2
+```
+
+## Failover
+
+The client watches all connections. A closed connection, an error of any node or no answer within `--timeout`
+(3000 ms plus 20 ms per token of the batch) is a failure of the chain. The client then checks the nodes
+(`hello`, in parallel), replaces the dead ones by `--spare` nodes that run the same layers, opens the session again
+and reads the context once more in batches. The generation continues where it stopped; the text is the same.
+
+```sh
+agent-node client -m model.gguf --chain A,B,C --spare D --spare-keys KD --spare-pins FPD ...
+```
+
+Not done yet (see the transport spec of the agent repository): replay of the forward history by the previous node
+instead of reading the whole context again (long contexts), int8 hidden states.
 
 Supported architectures: those with layer range support (llama, qwen35, qwen35moe).

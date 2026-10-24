@@ -29,6 +29,8 @@ enum class msg : uint8_t {
     stats    = 7,  // client -> node: ask for the counters of a session
     stats_ok = 8,  // node -> client
     error    = 9,  // any direction: the request failed, body is a message
+    hello    = 10, // anyone -> node: what do you run (no token needed; liveness and discovery of spare nodes)
+    hello_ok = 11, // node -> anyone
 };
 
 enum class payload : uint8_t {
@@ -165,10 +167,14 @@ struct open_msg {
     std::string next;         // address of the next node, empty: this is the last node, results go back to the client
     payload     hidden  = payload::f16; // how the nodes of this session pass hidden states (optional field)
     uint32_t    n_rollback = 0;         // how many trailing tokens of a forward may be rolled back (speculative decoding, optional field)
+    std::string token;                  // access token of this node for the session (optional field)
+    std::string next_token;             // access token of the next node, presented by this node in attach
+    std::string next_pin;               // expected certificate fingerprint of the next node ("" = not checked)
 
     writer write() const {
         writer w;
         w.put(version).put(session).put(n_ctx).put(n_top).put_str(next).put((uint8_t) hidden).put(n_rollback);
+        w.put_str(token).put_str(next_token).put_str(next_pin);
         return w;
     }
     static open_msg read(reader & r) {
@@ -183,6 +189,11 @@ struct open_msg {
         }
         if (r.left() >= 4) {
             m.n_rollback = r.get<uint32_t>();
+        }
+        if (r.left() >= 12) {
+            m.token      = r.get_str();
+            m.next_token = r.get_str();
+            m.next_pin   = r.get_str();
         }
         return m;
     }
@@ -208,6 +219,52 @@ struct open_ok_msg {
         m.n_layer     = r.get<int32_t>();
         m.n_embd      = r.get<int32_t>();
         m.n_vocab     = r.get<int32_t>();
+        m.desc        = r.get_str();
+        return m;
+    }
+};
+
+struct attach_msg {
+    uint64_t    session = 0;
+    std::string token; // access token of the receiving node for the session
+
+    writer write() const {
+        writer w;
+        w.put(session).put_str(token);
+        return w;
+    }
+    static attach_msg read(reader & r) {
+        attach_msg m;
+        m.session = r.get<uint64_t>();
+        if (r.left() >= 4) {
+            m.token = r.get_str();
+        }
+        return m;
+    }
+};
+
+struct hello_ok_msg {
+    uint32_t    version     = PROTOCOL_VERSION;
+    int32_t     layer_start = 0;
+    int32_t     layer_end   = 0;
+    int32_t     n_layer     = 0;
+    uint8_t     tls         = 0;
+    uint8_t     auth        = 0; // the node requires access tokens
+    std::string desc;
+
+    writer write() const {
+        writer w;
+        w.put(version).put(layer_start).put(layer_end).put(n_layer).put(tls).put(auth).put_str(desc);
+        return w;
+    }
+    static hello_ok_msg read(reader & r) {
+        hello_ok_msg m;
+        m.version     = r.get<uint32_t>();
+        m.layer_start = r.get<int32_t>();
+        m.layer_end   = r.get<int32_t>();
+        m.n_layer     = r.get<int32_t>();
+        m.tls         = r.get<uint8_t>();
+        m.auth        = r.get<uint8_t>();
         m.desc        = r.get_str();
         return m;
     }
