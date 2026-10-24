@@ -9,8 +9,19 @@
 #    ifndef NOMINMAX
 #        define NOMINMAX
 #    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN // no wincrypt.h
+#    endif
 #    include <winsock2.h>
 #    include <ws2tcpip.h>
+// wincrypt.h, if some header pulled it in anyway, defines names that OpenSSL / BoringSSL use
+#    undef X509_NAME
+#    undef X509_EXTENSIONS
+#    undef X509_CERT_PAIR
+#    undef PKCS7_ISSUER_AND_SERIAL
+#    undef PKCS7_SIGNER_INFO
+#    undef OCSP_REQUEST
+#    undef OCSP_RESPONSE
 typedef SOCKET agent_socket_t;
 #    define AGENT_INVALID_SOCKET INVALID_SOCKET
 #else

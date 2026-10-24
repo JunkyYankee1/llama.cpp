@@ -14,6 +14,10 @@
 #ifdef _WIN32
 #    include <windows.h>
 #    include <shellapi.h>
+#    undef X509_NAME
+#    undef X509_EXTENSIONS
+#    undef OCSP_REQUEST
+#    undef OCSP_RESPONSE
 #endif
 
 #include "common.h"
