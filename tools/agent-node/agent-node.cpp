@@ -1783,7 +1783,7 @@ static int cmd_client(const cli_args & a) {
     const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
 
     // a chain from the coordinator: nodes and spares with their pins and tokens for one session
-    // --tier fast: the fastest chain and the draft model; economy: the cheapest chain, no draft (bench: coordinator /v1/quote)
+    // --tier fast: the fastest chain; economy: the cheapest chain (coordinator /v1/quote); the draft model works in both
     const std::string tier = a.get("--tier", "", "fast");
     if (tier != "fast" && tier != "economy") {
         throw std::runtime_error("--tier must be fast or economy");
@@ -1829,11 +1829,7 @@ static int cmd_client(const cli_args & a) {
     // speculative decoding: a small draft model on the client, --draft-max tokens per pass over the chain
     std::unique_ptr<draft_model> dm;
     const int32_t n_draft = a.get_int("--draft-max", "", 6);
-    if (a.has("--draft") && tier == "economy") {
-        // the draft makes the chain verify rejected words too: more work, more points
-        AN_LOG("warning: --tier economy runs without the draft model, --draft is ignored\n");
-    }
-    if (a.has("--draft") && tier != "economy") {
+    if (a.has("--draft")) {
         if (n_draft < 1 || n_draft > 32) {
             throw std::runtime_error("--draft-max must be 1..32");
         }
