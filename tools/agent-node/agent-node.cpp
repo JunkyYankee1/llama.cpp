@@ -12,6 +12,7 @@
 #include "gpu_clocks.h"
 #include "protocol.h"
 #include "secure.h"
+#include "slice.h"
 
 #ifdef _WIN32
 #    include <windows.h>
@@ -73,7 +74,8 @@ struct cli_args {
     std::vector<std::string>           positional;
 
     static bool is_flag(const std::string & name) {
-        return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose";
+        return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose" ||
+               name == "--vocab-only";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -102,6 +104,7 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
+            "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -771,11 +774,232 @@ static double measure_ms_per_layer(const llama_model * model, const model_opts &
     return (now_ms() - t0) / n_run / std::max(1, p.last - p.first);
 }
 
+//
+// a node without a model file: the coordinator assigns the layers, the node downloads only them
+//
+
+static std::string fmt_gb(uint64_t n) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f GB", n / 1e9);
+    return buf;
+}
+
+// prints the progress of a download about every 5 s (the scripts show the lines with "download")
+static std::function<void(const slice_progress &)> download_printer() {
+    struct st { double t0 = 0, t_last = -1; uint64_t d0 = 0; bool first = true; };
+    auto state = std::make_shared<st>();
+    state->t0 = now_ms();
+    return [state](const slice_progress & p) {
+        const double t = now_ms();
+        if (state->first) {
+            // a resumed download: the speed counts only what comes now (about: up to 8 MB of this call are new)
+            state->first = false;
+            state->d0    = p.done > (8u << 20) ? p.done - (8u << 20) : 0;
+        }
+        if (p.done < p.total && state->t_last >= 0 && t - state->t_last < 5000) {
+            return;
+        }
+        state->t_last = t;
+        const double mbps = t > state->t0 ? (p.done - state->d0) / 1e6 / ((t - state->t0) / 1000) : 0;
+        printf("agent-node: download %s of %s (%.0f%%), %.1f MB/s\n", fmt_gb(p.done).c_str(), fmt_gb(p.total).c_str(),
+            p.total ? 100.0 * p.done / p.total : 100.0, mbps);
+        fflush(stdout);
+    };
+}
+
+// the full model by URL; a failing huggingface.co URL is retried through the mirror
+static void open_model_source(model_source & ms, const std::string & url, const std::string & mirror) {
+    try {
+        ms.open(url);
+        return;
+    } catch (const std::exception & e) {
+        const std::string hf = "https://huggingface.co/";
+        if (mirror.empty() || url.rfind(hf, 0) != 0) {
+            throw;
+        }
+        AN_LOG("warning: %s; trying %s\n", e.what(), mirror.c_str());
+    }
+    std::string m = mirror;
+    while (!m.empty() && m.back() == '/') {
+        m.pop_back();
+    }
+    ms = model_source();
+    ms.open(m + url.substr(std::string("https://huggingface.co").size()));
+}
+
+struct slice_file {
+    std::string path;
+    int32_t     first = 0, last = 0;
+    uint64_t    bytes = 0;
+};
+
+// the slices of this model already in the folder
+static std::vector<slice_file> find_slices(const std::string & dir, const std::string & key) {
+    std::vector<slice_file> out;
+    std::error_code ec;
+    for (const auto & e : std::filesystem::directory_iterator(slice_path(dir), ec)) {
+        if (!e.is_regular_file() || e.path().extension() != ".gguf") {
+            continue;
+        }
+#if defined(__cpp_char8_t)
+        const auto u8 = e.path().u8string();
+        const std::string p(u8.begin(), u8.end());
+#else
+        const std::string p = e.path().u8string();
+#endif
+        gguf_ptr g = read_local_header(p);
+        if (!g || gguf_str(g.get(), "agent.model_key") != key) {
+            continue;
+        }
+        slice_file f;
+        f.path  = p;
+        f.first = (int32_t) gguf_int(g.get(), "agent.layer_start");
+        f.last  = (int32_t) gguf_int(g.get(), "agent.layer_end");
+        f.bytes = (uint64_t) e.file_size();
+        if (f.first >= 0 && f.last > f.first) {
+            out.push_back(f);
+        }
+    }
+    return out;
+}
+
+static std::string slice_name(const std::string & url, int32_t first, int32_t last) {
+    std::string base = url.substr(url.find_last_of("/\\") + 1);
+    const size_t q = base.find('?');
+    if (q != std::string::npos) {
+        base = base.substr(0, q);
+    }
+    if (base.size() > 5 && base.compare(base.size() - 5, 5, ".gguf") == 0) {
+        base = base.substr(0, base.size() - 5);
+    }
+    if (base.size() > 15 && base.compare(base.size() - 15, 4, "-000") == 0 && base.find("-of-", base.size() - 10) != std::string::npos) {
+        base = base.substr(0, base.size() - 15); // "-00001-of-00004"
+    }
+    return base + ".L" + std::to_string(first) + "-" + std::to_string(last) + ".gguf";
+}
+
+// asks the coordinator which layers to hold (by the free video memory and the disk space this node gives),
+// downloads that slice unless it is already here, and points mo at it
+static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const std::string & fingerprint) {
+    const std::string url    = a.get("--model-url", "", "");
+    const std::string coord  = a.get("--coordinator", "", "");
+    const std::string dir    = a.get("--models-dir", "", "models");
+    if (coord.empty()) {
+        throw std::runtime_error("--model-url needs --coordinator: the coordinator assigns the layers");
+    }
+    std::filesystem::create_directories(slice_path(dir));
+
+    model_source ms;
+    open_model_source(ms, url, a.get("--mirror", "", ""));
+    AN_LOG("node: model %s, %d layers, %s in all\n", ms.key.c_str(), ms.n_layer, fmt_gb(ms.slice_bytes(0, ms.n_layer)).c_str());
+
+    // video memory: the free memory of the device minus a reserve for the context and the compute buffers
+    uint64_t vram = 0;
+    if (a.has("--vram-gb")) {
+        vram = (uint64_t) (std::stod(a.get("--vram-gb", "", "0")) * 1e9);
+    } else {
+        ggml_backend_dev_t dev = mo.device.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
+                                                   : ggml_backend_dev_by_name(mo.device.c_str());
+        if (dev == nullptr) {
+            throw std::runtime_error("no GPU found; give the memory for the model with --vram-gb");
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        const uint64_t reserve = (uint64_t) a.get_int("--vram-reserve-mb", "", 1024) << 20;
+        vram = free > reserve ? free - reserve : 0;
+        AN_LOG("node: %s: %s free of %s, %s for the model\n", ggml_backend_dev_description(dev), fmt_gb(free).c_str(),
+            fmt_gb(total).c_str(), fmt_gb(vram).c_str());
+    }
+
+    // disk: what the participant gives, but no more than there is (slices of this model already here count as free)
+    std::vector<slice_file> have = find_slices(dir, ms.key);
+    uint64_t have_bytes = 0;
+    for (const auto & h : have) {
+        have_bytes += h.bytes;
+    }
+    std::error_code ec;
+    const auto sp = std::filesystem::space(slice_path(dir), ec);
+    const uint64_t avail  = ec ? 0 : (uint64_t) sp.available;
+    const uint64_t margin = 1ull << 30;
+    uint64_t disk = (uint64_t) (std::stod(a.get("--disk-gb", "", "25")) * 1e9);
+    disk = std::min(disk, avail + have_bytes > margin ? avail + have_bytes - margin : 0);
+    AN_LOG("node: disk for the model %s (%s free in %s)\n", fmt_gb(disk).c_str(), fmt_gb(avail).c_str(), dir.c_str());
+
+    json have_j = json::array();
+    for (const auto & h : have) {
+        have_j.push_back({ { "layer_start", h.first }, { "layer_end", h.last } });
+    }
+    json req = {
+        { "model", ms.key },
+        { "n_layer", ms.n_layer },
+        { "layer_bytes", ms.layer_bytes },
+        { "embd_bytes", ms.embd_bytes },
+        { "output_bytes", ms.output_bytes },
+        { "other_bytes", ms.other_bytes },
+        { "vram_bytes", vram },
+        { "disk_bytes", disk },
+        { "have", have_j },
+        { "tls_fingerprint", fingerprint },
+        { "city", a.get("--city", "", "") },
+    };
+    int32_t first = -1, last = -1;
+    for (int attempt = 0; first < 0; attempt++) {
+        try {
+            const http_reply r = coord_post(coord, "/v1/assign", req);
+            if (r.status != 200) {
+                throw std::runtime_error("the coordinator assigns no layers: " + r.error());
+            }
+            first = r.body.value("layer_start", -1);
+            last  = r.body.value("layer_end", -1);
+            if (first < 0 || last <= first || last > ms.n_layer) {
+                throw std::runtime_error("the coordinator assigned a bad range");
+            }
+        } catch (const std::exception & e) {
+            if (attempt == 0 || attempt % 10 == 0) {
+                AN_LOG("warning: %s (retrying)\n", e.what());
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(std::min(30, 2 + attempt * 2)));
+        }
+    }
+    printf("agent-node: the coordinator assigned layers %d:%d (%s)\n", first, last, fmt_gb(ms.slice_bytes(first, last)).c_str());
+    fflush(stdout);
+
+    std::string path;
+    for (const auto & h : have) {
+        if (h.first == first && h.last == last) {
+            path = h.path;
+        }
+    }
+    // the other slices of this model are not needed any more: they free the disk for the new one
+    for (const auto & h : have) {
+        if (h.path != path) {
+            AN_LOG("node: removing the old slice %s (layers %d:%d)\n", h.path.c_str(), h.first, h.last);
+            std::filesystem::remove(slice_path(h.path), ec);
+        }
+    }
+    if (path.empty()) {
+        path = (std::filesystem::path(slice_path(dir)) / slice_path(slice_name(url, first, last))).u8string().c_str();
+        write_slice(ms, first, last, path, download_printer());
+    }
+    mo.path        = path;
+    mo.layer_start = first;
+    mo.layer_end   = last;
+}
+
 static std::string model_key(const std::string & path);
 
 static int cmd_node(const cli_args & a) {
     node_server srv;
-    srv.mo        = model_opts_from(a);
+    const bool assigned = a.has("--model-url");
+    if (assigned && (a.has("-m") || a.has("--model") || a.has("--layers"))) {
+        throw std::runtime_error("--model-url takes the place of -m and --layers: the coordinator assigns the layers");
+    }
+    if (assigned) {
+        srv.mo.n_gpu_layers = a.get_int("-ngl", "--n-gpu-layers", 999);
+        srv.mo.device       = a.get("--device", "-dev", "");
+    } else {
+        srv.mo = model_opts_from(a);
+    }
     srv.n_threads = a.get_int("-t", "--threads", common_cpu_get_num_math());
 
     const std::string host = a.get("--host", "", "127.0.0.1");
@@ -813,6 +1037,13 @@ static int cmd_node(const cli_args & a) {
 #endif
     if (!a.has("--tls")) {
         AN_LOG("warning: no --tls, the traffic of the node is not encrypted\n");
+    }
+
+    if (assigned) {
+        if (fingerprint.empty() || srv.key.empty()) {
+            throw std::runtime_error("--model-url needs --tls and --key: the coordinator only hands out protected nodes");
+        }
+        prepare_assigned_slice(a, srv.mo, fingerprint);
     }
 
     srv.model = load_model(srv.mo);
@@ -2039,39 +2270,11 @@ static int cmd_token(const cli_args & a) {
 // so llama_model_desc is not known there): name and shape from the GGUF metadata plus a hash of the tensor names, types
 // and sizes, which differs between quantizations; reads only the metadata
 static std::string model_key(const std::string & path) {
-    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
-    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
-    if (g == nullptr) {
+    gguf_ptr g = read_local_header(path);
+    if (!g) {
         throw std::runtime_error("cannot read the GGUF metadata of " + path);
     }
-    auto get_str = [&](const std::string & key) -> std::string {
-        const int64_t id = gguf_find_key(g, key.c_str());
-        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id) : "";
-    };
-    auto get_u32 = [&](const std::string & key) -> long long {
-        const int64_t id = gguf_find_key(g, key.c_str());
-        return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32 ? (long long) gguf_get_val_u32(g, id) : -1;
-    };
-    uint64_t h = 1469598103934665603ull; // FNV-1a
-    auto mix = [&](const void * p, size_t n) {
-        for (size_t i = 0; i < n; i++) {
-            h = (h ^ ((const uint8_t *) p)[i]) * 1099511628211ull;
-        }
-    };
-    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
-        const char *   name = gguf_get_tensor_name(g, i);
-        const int32_t  type = (int32_t) gguf_get_tensor_type(g, i);
-        const uint64_t size = (uint64_t) gguf_get_tensor_size(g, i);
-        mix(name, strlen(name) + 1);
-        mix(&type, sizeof(type));
-        mix(&size, sizeof(size));
-    }
-    const std::string arch = get_str("general.architecture");
-    char buf[512];
-    snprintf(buf, sizeof(buf), "%s %s L%lld E%lld #%016llx", arch.c_str(), get_str("general.name").c_str(),
-        get_u32(arch + ".block_count"), get_u32(arch + ".embedding_length"), (unsigned long long) h);
-    gguf_free(g);
-    return buf;
+    return model_key_of({ g.get() });
 }
 
 static int cmd_info(const cli_args & a) {
@@ -2094,6 +2297,32 @@ static int cmd_info(const cli_args & a) {
         get_u32(arch + ".block_count"), get_u32(arch + ".embedding_length"), get_u32(arch + ".full_attention_interval"),
         json(model_key(path)).dump().c_str());
     gguf_free(g);
+    return 0;
+}
+
+// slice: writes the slice of a model with a layer range (or only the metadata, for the vocabulary of a client),
+// from a URL (HTTP ranges, only the bytes of the slice are downloaded) or a local file
+static int cmd_slice(const cli_args & a) {
+    const std::string from = a.get("--from", "", "");
+    const std::string out  = a.get("--out", "", "");
+    if (from.empty() || out.empty()) {
+        throw std::runtime_error("slice needs --from URL|PATH and --out FILE");
+    }
+    model_source ms;
+    open_model_source(ms, from, a.get("--mirror", "", ""));
+    int32_t first = 0, last = 0;
+    if (!a.has("--vocab-only")) {
+        const std::string layers = a.get("--layers", "", "");
+        const size_t p = layers.find(':');
+        if (p == std::string::npos) {
+            throw std::runtime_error("slice needs --layers START:END or --vocab-only");
+        }
+        first = std::stoi(layers.substr(0, p));
+        last  = p + 1 < layers.size() ? std::stoi(layers.substr(p + 1)) : ms.n_layer;
+    }
+    write_slice(ms, first, last, out, download_printer());
+    printf("{\"model_key\":%s,\"n_layer\":%d,\"layer_start\":%d,\"layer_end\":%d,\"bytes\":%llu}\n", json(ms.key).dump().c_str(),
+        ms.n_layer, first, last, (unsigned long long) std::filesystem::file_size(slice_path(out)));
     return 0;
 }
 
@@ -2136,6 +2365,8 @@ static void usage() {
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
+        "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
+        "                       only the weights of the range (downloaded by HTTP ranges), with the metadata of the model\n"
         "  agent-node devices                                  the compute devices (JSON: name, type, memory)\n"
         "  agent-node keygen                                   a secret key of a node (for access tokens)\n"
         "  agent-node identity  --identity node.pem            create/read the TLS identity, print its fingerprint\n"
@@ -2147,6 +2378,8 @@ static void usage() {
         "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
+        "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
+        "                  instead of -m and --layers: the coordinator assigns the layers, the node downloads only them\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
         "\n"
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
@@ -2209,6 +2442,9 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "info") {
             return cmd_info(a);
+        }
+        if (cmd == "slice") {
+            return cmd_slice(a);
         }
 
         llama_log_set(log_callback, nullptr);

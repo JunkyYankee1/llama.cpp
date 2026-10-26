@@ -1117,7 +1117,8 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    if (!skipped.empty() && skipped.count(tn.str())) {
+    if (skip_pred && skip_pred(tn.str())) {
+        // outside the layer range: not loaded, and a slice of the model (agent-node) may not have it at all
         return nullptr;
     }
 
@@ -1401,6 +1402,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::skip_weights(const std::function<bool(const std::string & name)> & pred) {
+    skip_pred = pred;
     size_t n_bytes = 0;
     for (const auto & [name, w] : weights_map) {
         if (pred(name) && skipped.insert(name).second) {

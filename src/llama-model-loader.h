@@ -239,10 +239,12 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    // tensors of the files that the model does not use (e.g. outside the layer range): they count as created
-    // and create_tensor returns null for them, so the weights are neither allocated nor read
+    // tensors that the model does not use (e.g. outside the layer range): those in the files count as created,
+    // and create_tensor returns null for all of them, also for those the files do not have (a slice of a model),
+    // so the weights are neither allocated nor read
     void skip_weights(const std::function<bool(const std::string & name)> & pred);
     std::set<std::string> skipped;
+    std::function<bool(const std::string & name)> skip_pred;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
