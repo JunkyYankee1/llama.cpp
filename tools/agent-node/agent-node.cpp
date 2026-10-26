@@ -100,7 +100,7 @@ struct cli_args {
             "--force", "--hidden", "--host", "--ignore-eos", "--json", "--layers", "--model", "--n-gpu-layers", "--n-predict",
             "--no-chat", "--port", "--prompt", "--same-tokens", "--threads", "--tokens", "--tol", "--top", "--top1", "--verbose",
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
-            "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares", "--tier",
+            "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
@@ -1732,31 +1732,6 @@ static void print_speed(const gen_result & r) {
     }
 }
 
-// both tiers of a task before running it: what the user chooses between
-static int cmd_quote(const cli_args & a) {
-    const gen_opts g = gen_opts_from(a);
-    model_opts mo = model_opts_from(a);
-    mo.vocab_only = true;
-    llama_model_ptr model = load_model(mo);
-    const std::vector<llama_token> prompt = make_prompt(llama_model_get_vocab(model.get()), model.get(), g);
-    const json req = { { "model", model_key(mo.path) }, { "prompt_tokens", prompt.size() }, { "max_tokens", g.n_gen } };
-    const http_reply r = coord_post(a.get("--coordinator", "", ""), "/v1/quote", req);
-    if (r.status != 200) {
-        throw std::runtime_error("the coordinator gave no quote: " + r.error());
-    }
-    printf("task: %zu prompt tokens, up to %d tokens of answer\n", prompt.size(), g.n_gen);
-    for (const auto & o : r.body.at("options")) {
-        const std::string tier = o.value("tier", "");
-        if (!o.value("available", false)) {
-            printf("  %-8s not available: %s\n", tier.c_str(), o.value("reason", "").c_str());
-            continue;
-        }
-        printf("  %-8s %2d nodes%s, about %.1f tokens/s, %.1f s, %.1f points\n", tier.c_str(), o.value("nodes", 0),
-            o.value("draft", false) ? " + draft" : "", o.value("tokens_per_s", 0.0), o.value("seconds", 0.0), o.value("price", 0.0));
-    }
-    return 0;
-}
-
 static int cmd_client(const cli_args & a) {
     const gen_opts g = gen_opts_from(a);
 
@@ -1780,20 +1755,12 @@ static int cmd_client(const cli_args & a) {
     llama_model_ptr model = load_model(mo);
     const llama_vocab * vocab = llama_model_get_vocab(model.get());
 
-    const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
-
     // a chain from the coordinator: nodes and spares with their pins and tokens for one session
-    // --tier fast: the fastest chain; economy: the cheapest chain (coordinator /v1/quote); the draft model works in both
-    const std::string tier = a.get("--tier", "", "fast");
-    if (tier != "fast" && tier != "economy") {
-        throw std::runtime_error("--tier must be fast or economy");
-    }
     std::vector<node_ref> coord_nodes, coord_spares;
     uint64_t coord_session = 0;
     if (a.has("--coordinator")) {
         json req = { { "model", model_key(mo.path) },
-                     { "spares", a.get_int("--spares", "", 1) }, { "ttl_s", a.get_int("--token-ttl", "", 3600) },
-                     { "tier", tier }, { "prompt_tokens", prompt.size() }, { "max_tokens", g.n_gen } };
+                     { "spares", a.get_int("--spares", "", 1) }, { "ttl_s", a.get_int("--token-ttl", "", 3600) } };
         if (a.has("--city")) {
             req["city"] = a.get("--city", "", "");
         }
@@ -1819,12 +1786,9 @@ static int cmd_client(const cli_args & a) {
             coord_nodes.size(), coord_spares.size(), r.body.at("session").get<std::string>().c_str(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
             r.body.value("stages_without_spare", 0));
-        if (r.body.contains("estimate") && r.body["estimate"].is_object()) {
-            const json & e = r.body["estimate"];
-            AN_LOG("coordinator: tier %s, about %.1f tokens/s, %.1f s, %.1f points (%.4f per token)\n", tier.c_str(),
-                e.value("tokens_per_s", 0.0), e.value("seconds", 0.0), e.value("price", 0.0), e.value("price_per_token", 0.0));
-        }
     }
+
+    const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
 
     // speculative decoding: a small draft model on the client, --draft-max tokens per pass over the chain
     std::unique_ptr<draft_model> dm;
@@ -2154,8 +2118,7 @@ static void usage() {
         "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
-        "             client --coordinator URL [--spares 1] [--city NAME] [--tier fast|economy]   (instead of --chain)\n"
-        "             quote  --coordinator URL -m model.gguf [-p TEXT] [-n 512]   time and points of both tiers\n"
+        "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
         "\n"
         "the client needs the same model file only for its tokenizer, it loads no weights\n");
 }
@@ -2214,9 +2177,6 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "token") {
             return cmd_token(a);
-        }
-        if (cmd == "quote") {
-            return cmd_quote(a);
         }
         if (cmd == "info") {
             return cmd_info(a);
