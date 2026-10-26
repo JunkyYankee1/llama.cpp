@@ -2097,6 +2097,34 @@ static int cmd_info(const cli_args & a) {
     return 0;
 }
 
+// devices: the compute devices ggml sees, as JSON, so that scripts can pick the right one
+// (for example the discrete card and not the integrated one when both are Vulkan devices)
+static int cmd_devices() {
+    json out = json::array();
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        const char * type = "other";
+        switch (props.type) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:   type = "cpu";   break;
+            case GGML_BACKEND_DEVICE_TYPE_GPU:   type = "gpu";   break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:  type = "igpu";  break;
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL: type = "accel"; break;
+            default: break;
+        }
+        out.push_back({
+            { "name", props.name ? props.name : "" },
+            { "description", props.description ? props.description : "" },
+            { "type", type },
+            { "memory_total", (uint64_t) props.memory_total },
+            { "memory_free", (uint64_t) props.memory_free },
+        });
+    }
+    printf("%s\n", out.dump().c_str());
+    return 0;
+}
+
 static void usage() {
     fprintf(stderr,
         "usage:\n"
@@ -2108,6 +2136,7 @@ static void usage() {
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
+        "  agent-node devices                                  the compute devices (JSON: name, type, memory)\n"
         "  agent-node keygen                                   a secret key of a node (for access tokens)\n"
         "  agent-node identity  --identity node.pem            create/read the TLS identity, print its fingerprint\n"
         "  agent-node token     --key HEX --session HEX [--ttl 3600]\n"
@@ -2187,6 +2216,9 @@ int main(int argc, char ** argv) {
         llama_backend_init();
         net_init();
 
+        if (cmd == "devices") {
+            return cmd_devices();
+        }
         if (cmd == "node") {
             return cmd_node(a);
         }
