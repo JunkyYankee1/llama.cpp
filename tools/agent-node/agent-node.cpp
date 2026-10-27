@@ -23,6 +23,7 @@
 #    undef OCSP_RESPONSE
 #endif
 
+#include "chat.h"
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -105,7 +106,7 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
-            "--account", "--parent-pid", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--account", "--parent-pid", "--chat-template", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -1830,7 +1831,40 @@ struct gen_opts {
     payload     hidden = payload::q8;
     // every generated token goes here instead of stdout; false stops the generation (the reader went away)
     std::function<bool(llama_token)> on_token;
+    // sampling from the top-k the last node returns: temperature 0 is greedy
+    float    temperature = 0.0f;
+    float    top_p       = 1.0f;
+    uint32_t seed        = 0;
 };
+
+// the next token from the top-k of one position (sorted by logit): greedy, or sampled with the temperature and top-p.
+// With a draft model the same choice is made at every checked position, and a draft token is accepted only when the
+// choice equals it: the text keeps the distribution of the model alone
+static llama_token choose_token(const top_entry * row, uint32_t n_top, const gen_opts & g, std::mt19937 & rng) {
+    if (g.temperature <= 0.0f || n_top <= 1) {
+        return row[0].id;
+    }
+    std::vector<double> p(n_top);
+    double sum = 0;
+    for (uint32_t i = 0; i < n_top; i++) {
+        p[i] = std::exp((row[i].logit - row[0].logit) / g.temperature);
+        sum += p[i];
+    }
+    // nucleus: the smallest prefix with the probability top_p
+    uint32_t n = n_top;
+    if (g.top_p < 1.0f) {
+        double acc = 0;
+        for (uint32_t i = 0; i < n_top; i++) {
+            acc += p[i] / sum;
+            if (acc >= g.top_p) {
+                n = i + 1;
+                break;
+            }
+        }
+    }
+    std::discrete_distribution<uint32_t> d(p.begin(), p.begin() + n);
+    return row[d(rng)].id;
+}
 
 static gen_opts gen_opts_from(const cli_args & a) {
     gen_opts g;
@@ -1903,6 +1937,7 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
 
     gen_result res;
     res.n_prompt = (int32_t) prompt.size();
+    std::mt19937 rng(g.seed);
 
     double t0 = now_ms();
     std::vector<top_entry> top;
@@ -1920,7 +1955,7 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
     t0 = now_ms();
     for (int32_t i = 0; i < g.n_gen; i++) {
         // with --force the context follows the reference, so every step compares logits on the same text
-        const llama_token tok = (size_t) i < g.force.size() ? g.force[i] : top[0].id;
+        const llama_token tok = (size_t) i < g.force.size() ? g.force[i] : choose_token(top.data(), (uint32_t) top.size(), g, rng);
         res.tokens.push_back(tok);
         if (dump) {
             fprintf(dump, "%d %d", i, tok);
@@ -2028,6 +2063,7 @@ struct draft_model {
 static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_vocab * vocab, const std::vector<llama_token> & prompt,
         const gen_opts & g, int32_t n_draft, double noise, const std::function<void()> & before_gen) {
     std::mt19937 rng(42);
+    std::mt19937 pick(g.seed);
     std::uniform_real_distribution<double> uni(0.0, 1.0);
     if ((uint32_t) (prompt.size() + g.n_gen + n_draft + 1) > g.n_ctx) {
         throw std::runtime_error("prompt + generation does not fit in the context, increase -c");
@@ -2089,7 +2125,7 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     };
 
     // the first token comes from the prompt; the draft model has not seen the last prompt token yet
-    llama_token last = top[0].id;
+    llama_token last = choose_token(top.data(), (uint32_t) top.size(), g, pick);
     int32_t     pos  = (int32_t) prompt.size(); // position of `last` for the chain
     bool done = emit(last, top.data());
 
@@ -2126,10 +2162,13 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
         res.n_rounds++;
         res.n_drafted += k;
 
-        // 3. accept the matching prefix, then the token of the chain after it
+        // 3. accept the matching prefix, then the token of the chain after it; with sampling every position is
+        //    sampled once, in order, and the first sample that differs from the draft ends the round
         int32_t a = 0;
-        while (a < k && rows[(size_t) a * g.n_top].id == batch[a + 1]) {
+        llama_token chosen = choose_token(&rows[0], g.n_top, g, pick);
+        while (a < k && chosen == batch[a + 1]) {
             a++;
+            chosen = choose_token(&rows[(size_t) a * g.n_top], g.n_top, g, pick);
         }
         res.n_accepted += a;
         for (int32_t j = 0; j < a && !done; j++) {
@@ -2138,7 +2177,7 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
         if (done) {
             break;
         }
-        const llama_token bonus = rows[(size_t) a * g.n_top].id;
+        const llama_token bonus = chosen;
         done = emit(bonus, &rows[(size_t) a * g.n_top]);
 
         // 4. the draft model goes back to `pos` and reads the accepted tokens in one batch;
@@ -2381,44 +2420,12 @@ static size_t utf8_complete(const std::string & s) {
     return n;
 }
 
-// the chat as the Qwen template writes it; think: the answer starts with the reasoning
-static std::string chat_prompt(const json & messages, bool think) {
-    std::string text;
-    for (const auto & m : messages) {
-        const std::string role = m.value("role", "user");
-        std::string content;
-        if (m.contains("content") && m["content"].is_string()) {
-            content = m["content"].get<std::string>();
-        } else if (m.contains("content") && m["content"].is_array()) {
-            for (const auto & part : m["content"]) {
-                if (part.value("type", "") == "text") {
-                    content += part.value("text", "");
-                }
-            }
-        }
-        if (role == "assistant") {
-            // earlier reasoning is not part of the history
-            const size_t e = content.find("</think>");
-            if (e != std::string::npos) {
-                content = content.substr(e + 8);
-                content.erase(0, content.find_first_not_of("\n"));
-            }
-        }
-        if (role != "system" && role != "user" && role != "assistant") {
-            continue;
-        }
-        text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
-    }
-    text += "<|im_start|>assistant\n";
-    text += think ? "<think>\n" : "<think>\n\n</think>\n\n";
-    return text;
-}
-
 struct serve_state {
     std::mutex                   mtx; // one generation at a time
     coord_account                acc;
     llama_model_ptr              vocab_model;
     const llama_vocab *          vocab = nullptr;
+    common_chat_templates_ptr    tmpls; // the chat template of the model (from the GGUF): prompt, reasoning, tool calls
     std::string                  key;  // model key for the coordinator
     std::string                  name; // model name for /v1/models
     std::unique_ptr<draft_model> dm;
@@ -2427,6 +2434,23 @@ struct serve_state {
     int                          spares  = 1;
     std::string                  city;
 };
+
+static json to_nl(const common_json & j) {
+    return json::parse(j.dump());
+}
+
+// the OpenAI delta of one tool call
+static json tool_call_delta(size_t index, const common_chat_tool_call & tc) {
+    json d = { { "index", index }, { "function", { { "arguments", tc.arguments } } } };
+    if (!tc.id.empty()) {
+        d["id"]   = tc.id;
+        d["type"] = "function";
+    }
+    if (!tc.name.empty()) {
+        d["function"]["name"] = tc.name;
+    }
+    return d;
+}
 
 static int cmd_serve(const cli_args & a) {
     if (!a.has("--coordinator")) {
@@ -2437,6 +2461,8 @@ static int cmd_serve(const cli_args & a) {
     mo.vocab_only = true;
     st->vocab_model = load_model(mo);
     st->vocab   = llama_model_get_vocab(st->vocab_model.get());
+    // --chat-template FILE: a template instead of the one in the GGUF (tests, models with a broken template)
+    st->tmpls   = common_chat_templates_init(st->vocab_model.get(), a.has("--chat-template") ? read_file(a.get("--chat-template", "", "")) : "");
     st->key     = model_key(mo.path);
     st->name    = st->key.substr(0, st->key.find(" #"));
     st->n_ctx   = (uint32_t) a.get_int("-c", "--ctx-size", 8192);
@@ -2455,13 +2481,6 @@ static int cmd_serve(const cli_args & a) {
         }
     }
     const payload hidden = gen_opts_from(a).hidden;
-
-    // special tokens of the reasoning, by id (they are single tokens in the Qwen vocabulary)
-    auto single = [&](const char * text) -> llama_token {
-        const auto t = common_tokenize(st->vocab, text, false, true);
-        return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
-    };
-    const llama_token tok_think = single("<think>"), tok_unthink = single("</think>");
 
     httplib::Server http;
     // only the app may call the API: a web page in a browser on this PC must not spend the points of the account.
@@ -2519,29 +2538,60 @@ static int cmd_serve(const cli_args & a) {
         res.set_content(r->body, "application/json");
     });
 
-    http.Post("/v1/chat/completions", [st, hidden, tok_think, tok_unthink](const httplib::Request & req, httplib::Response & res) {
+    http.Post("/v1/chat/completions", [st, hidden](const httplib::Request & req, httplib::Response & res) {
+        auto fail = [&](int status, const std::string & msg) {
+            res.status = status;
+            res.set_content(json{ { "error", { { "message", msg } } } }.dump(), "application/json");
+        };
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array()) {
-            res.status = 400;
-            res.set_content("{\"error\":{\"message\":\"messages are required\"}}", "application/json");
-            return;
+            return fail(400, "messages are required");
         }
-        const bool stream = body.value("stream", false);
-        const bool think  = body.value("think", true);
-        const std::vector<llama_token> prompt = common_tokenize(st->vocab, chat_prompt(body["messages"], think), true, true);
+        // the prompt from the chat template of the model: reasoning on or off, tools in its own format
+        auto inputs = std::make_shared<common_chat_templates_inputs>();
+        std::shared_ptr<common_chat_session> cs;
+        std::vector<llama_token> prompt;
+        try {
+            inputs->messages = common_chat_msgs_parse_oaicompat(common_json::parse(body["messages"].dump()));
+            if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+                inputs->tools = common_chat_tools_parse_oaicompat(common_json::parse(body["tools"].dump()));
+                if (body.contains("tool_choice") && body["tool_choice"].is_string()) {
+                    inputs->tool_choice = common_chat_tool_choice_parse_oaicompat(body["tool_choice"].get<std::string>());
+                }
+                inputs->parallel_tool_calls = body.value("parallel_tool_calls", false);
+            }
+            inputs->enable_thinking  = body.value("think", true);
+            inputs->reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            cs = std::make_shared<common_chat_session>(st->tmpls.get(), st->vocab, *inputs);
+            bool first = true;
+            for (const auto & part : cs->prompt().parts) {
+                // text of the user is not parsed for special tokens: a message cannot forge a turn of the template
+                const auto t = common_tokenize(st->vocab, part.text, first, !part.is_input);
+                prompt.insert(prompt.end(), t.begin(), t.end());
+                first = false;
+            }
+        } catch (const std::exception & e) {
+            return fail(400, std::string("bad chat: ") + e.what());
+        }
+        if (g_verbose) {
+            AN_LOG("serve: prompt (%zu tokens):\n%s\n", prompt.size(), cs->prompt().str().c_str());
+        }
         const int32_t room = (int32_t) st->n_ctx - (int32_t) prompt.size() - st->n_draft - 2;
         if (room < 16) {
-            res.status = 400;
-            res.set_content("{\"error\":{\"message\":\"the conversation does not fit in the context\"}}", "application/json");
-            return;
+            return fail(400, "the conversation does not fit in the context");
         }
         const int32_t max_tokens = std::clamp(body.value("max_tokens", 2048), 1, room);
+        const float temperature = body.value("temperature", 0.7f);
+        const float top_p       = body.value("top_p", 0.95f);
+        const uint32_t seed     = body.contains("seed") ? body.value("seed", 0u) : (uint32_t) std::random_device{}();
+        const bool stream       = body.value("stream", false);
         const std::string id = "chatcmpl-" + std::to_string((long long) (now_ms() * 1000));
         const long long created = (long long) std::time(nullptr);
 
-        // runs the request; out(kind, text) gets "reasoning" / "content" pieces, false: stop
-        auto run = [st, hidden, prompt, max_tokens, think, tok_think, tok_unthink](
-                       const std::function<bool(const std::string &, const std::string &)> & out, json & usage, std::string & finish) {
+        // runs the request; out(delta) gets OpenAI deltas (reasoning_content, content, tool_calls), false: stop.
+        // final: the whole message
+        auto run = [st, hidden, prompt, max_tokens, temperature, top_p, seed, cs](
+                       const std::function<bool(const json &)> & out, json & usage, std::string & finish, common_chat_msg & final_msg) {
             std::lock_guard<std::mutex> lock(st->mtx);
             const coord_chain c = request_chain(st->acc, st->key, st->spares, 3600, st->city);
             chain_opts co;
@@ -2550,7 +2600,7 @@ static int cmd_serve(const cli_args & a) {
             co.session    = c.session;
             co.tls        = true;
             co.n_ctx      = st->n_ctx;
-            co.n_top      = 8;
+            co.n_top      = 16; // the candidates for sampling
             co.hidden     = hidden;
             co.n_rollback = st->dm ? (uint32_t) st->n_draft : 0;
             chain_eval chain(co);
@@ -2558,85 +2608,111 @@ static int cmd_serve(const cli_args & a) {
                 throw std::runtime_error("the tokenizer does not match the model of the chain");
             }
             gen_opts g;
-            g.n_gen  = max_tokens;
-            g.n_ctx  = st->n_ctx;
-            g.hidden = hidden;
-            bool in_think = think;
-            std::string pending;
+            g.n_gen       = max_tokens;
+            g.n_ctx       = st->n_ctx;
+            g.n_top       = co.n_top;
+            g.hidden      = hidden;
+            g.temperature = temperature;
+            g.top_p       = top_p;
+            g.seed        = seed;
+
+            common_chat_msg prev;
+            prev.role = "assistant";
+            std::vector<std::string> ids;
+            auto gen_id = []() { return "call_" + std::to_string((long long) (now_ms() * 1000)); };
+            std::string pending, raw;
             bool stopped = false, ended = false;
+            // the deltas between two parses of the message so far
+            auto emit = [&](common_chat_msg msg) {
+                msg.set_tool_call_ids(ids, gen_id);
+                for (const auto & d : common_chat_msg_diff::compute_diffs(prev, msg)) {
+                    json delta = json::object();
+                    if (!d.reasoning_content_delta.empty()) {
+                        delta["reasoning_content"] = d.reasoning_content_delta;
+                    }
+                    if (!d.content_delta.empty()) {
+                        delta["content"] = d.content_delta;
+                    }
+                    if (d.tool_call_index != std::string::npos) {
+                        delta["tool_calls"] = json::array({ tool_call_delta(d.tool_call_index, d.tool_call_delta) });
+                    }
+                    if (!delta.empty() && !out(delta)) {
+                        return false;
+                    }
+                }
+                prev = msg;
+                return true;
+            };
             g.on_token = [&](llama_token tok) {
                 if (llama_vocab_is_eog(st->vocab, tok)) {
                     ended = true;
                     return true;
                 }
-                if (tok == tok_think) {
-                    in_think = true;
-                    return true;
-                }
-                if (tok == tok_unthink) {
-                    if (!pending.empty() && !out("reasoning", pending)) {
-                        stopped = true;
-                        return false;
-                    }
-                    pending.clear();
-                    in_think = false;
-                    return true;
-                }
-                pending += common_token_to_piece(st->vocab, tok, false);
+                pending += common_token_to_piece(st->vocab, tok, true);
                 const size_t n = utf8_complete(pending);
-                if (n > 0) {
-                    if (!out(in_think ? "reasoning" : "content", pending.substr(0, n))) {
-                        stopped = true;
+                if (n == 0) {
+                    return true;
+                }
+                common_chat_input chunk;
+                chunk.append(pending.substr(0, n), tok);
+                raw += pending.substr(0, n);
+                pending.erase(0, n);
+                if (!emit(cs->feed(chunk))) {
+                    stopped = true;
+                    return false;
+                }
+                for (const auto & stop : cs->additional_stops()) {
+                    if (!stop.empty() && raw.size() >= stop.size() && raw.compare(raw.size() - stop.size(), stop.size(), stop) == 0) {
+                        ended = true;
                         return false;
                     }
-                    pending.erase(0, n);
                 }
                 return true;
             };
             const gen_result r = st->dm ? generate_spec(chain, *st->dm, st->vocab, prompt, g, st->n_draft, 0.0, nullptr)
                                         : generate(chain, st->vocab, prompt, g, nullptr);
-            if (!pending.empty() && !stopped) {
-                out(in_think ? "reasoning" : "content", pending);
+            common_chat_input tail;
+            if (!pending.empty()) {
+                tail = common_chat_input(pending);
+            }
+            final_msg = cs->finish(tail);
+            final_msg.set_tool_call_ids(ids, gen_id);
+            if (!stopped) {
+                emit(final_msg);
             }
             long long charged = 0;
             const long long balance = report_session(st->acc, c.session_hex, r.n_prompt, (int32_t) r.tokens.size(), &charged);
-            finish = ended ? "stop" : "length";
+            finish = !final_msg.tool_calls.empty() ? "tool_calls" : ended ? "stop" : "length";
             usage = { { "prompt_tokens", r.n_prompt }, { "completion_tokens", (int) r.tokens.size() },
                       { "total_tokens", r.n_prompt + (int) r.tokens.size() } };
             usage["agent"] = { { "session", c.session_hex }, { "points", charged }, { "balance", balance },
                                { "tok_s", r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0 }, { "nodes", c.nodes.size() } };
-            AN_LOG("serve: %d + %zu tokens, %.2f tok/s, %lld points (balance %lld)\n", r.n_prompt, r.tokens.size(),
-                r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0, charged, balance);
+            AN_LOG("serve: %d + %zu tokens, %.2f tok/s, %zu tool calls, %lld points (balance %lld)\n", r.n_prompt, r.tokens.size(),
+                r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0, final_msg.tool_calls.size(), charged, balance);
         };
 
         if (!stream) {
-            std::string content, reasoning, finish;
+            std::string finish;
             json usage;
+            common_chat_msg msg;
             try {
-                run([&](const std::string & kind, const std::string & text) {
-                    (kind == "reasoning" ? reasoning : content) += text;
-                    return true;
-                }, usage, finish);
+                run([](const json &) { return true; }, usage, finish, msg);
             } catch (const std::exception & e) {
-                res.status = std::string(e.what()).find("not enough points") != std::string::npos ? 402 : 503;
-                res.set_content(json{ { "error", { { "message", e.what() } } } }.dump(), "application/json");
-                return;
+                return fail(std::string(e.what()).find("not enough points") != std::string::npos ? 402 : 503, e.what());
             }
-            json msg = { { "role", "assistant" }, { "content", content } };
-            if (!reasoning.empty()) {
-                msg["reasoning_content"] = reasoning;
-            }
+            json m = to_nl(msg.to_json_oaicompat());
+            m["role"] = "assistant";
             json j = { { "id", id }, { "object", "chat.completion" }, { "created", created }, { "model", st->name },
-                       { "choices", json::array({ { { "index", 0 }, { "message", msg }, { "finish_reason", finish } } }) },
+                       { "choices", json::array({ { { "index", 0 }, { "message", m }, { "finish_reason", finish } } }) },
                        { "usage", usage } };
-            res.set_content(j.dump(), "application/json");
+            res.set_content(j.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
             return;
         }
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream", [st, run, id, created](size_t, httplib::DataSink & sink) {
             auto send = [&](const json & j) {
-                const std::string line = "data: " + j.dump() + "\n\n";
+                const std::string line = "data: " + j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                 return sink.write(line.data(), line.size());
             };
             auto chunk = [&](const json & delta, const json & finish) {
@@ -2646,10 +2722,9 @@ static int cmd_serve(const cli_args & a) {
             send(chunk({ { "role", "assistant" } }, nullptr));
             std::string finish;
             json usage;
+            common_chat_msg msg;
             try {
-                run([&](const std::string & kind, const std::string & text) {
-                    return send(chunk({ { kind == "reasoning" ? "reasoning_content" : "content", text } }, nullptr));
-                }, usage, finish);
+                run([&](const json & delta) { return send(chunk(delta, nullptr)); }, usage, finish, msg);
                 json last = chunk(json::object(), finish);
                 last["usage"] = usage;
                 send(last);
