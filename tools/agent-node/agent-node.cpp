@@ -36,6 +36,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -2346,6 +2347,318 @@ static int cmd_client(const cli_args & a) {
     return 0;
 }
 
+//
+// serve: the local API of the agent on the PC of the user (the app talks to it)
+//
+//   GET  /health
+//   GET  /v1/models
+//   POST /v1/chat/completions   OpenAI-style: {messages, max_tokens, stream, think}; the reasoning of the model goes to
+//                               delta.reasoning_content (the app shows the thinking line there), the answer to delta.content
+//   GET  /v1/account            balance and journal of the account of this PC (from the coordinator)
+//
+// every request takes a chain from the coordinator, runs over it (with the draft model when there is one) and reports
+// the session, so the account pays for the answer. One request at a time: the draft model is one.
+//
+
+// the longest prefix of s that does not end inside a UTF-8 character
+static size_t utf8_complete(const std::string & s) {
+    size_t n = s.size();
+    for (size_t back = 1; back <= 4 && back <= n; back++) {
+        const unsigned char c = (unsigned char) s[n - back];
+        if ((c & 0xC0) == 0x80) {
+            continue; // continuation byte
+        }
+        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+        return back < len ? n - back : n;
+    }
+    return n;
+}
+
+// the chat as the Qwen template writes it; think: the answer starts with the reasoning
+static std::string chat_prompt(const json & messages, bool think) {
+    std::string text;
+    for (const auto & m : messages) {
+        const std::string role = m.value("role", "user");
+        std::string content;
+        if (m.contains("content") && m["content"].is_string()) {
+            content = m["content"].get<std::string>();
+        } else if (m.contains("content") && m["content"].is_array()) {
+            for (const auto & part : m["content"]) {
+                if (part.value("type", "") == "text") {
+                    content += part.value("text", "");
+                }
+            }
+        }
+        if (role == "assistant") {
+            // earlier reasoning is not part of the history
+            const size_t e = content.find("</think>");
+            if (e != std::string::npos) {
+                content = content.substr(e + 8);
+                content.erase(0, content.find_first_not_of("\n"));
+            }
+        }
+        if (role != "system" && role != "user" && role != "assistant") {
+            continue;
+        }
+        text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+    }
+    text += "<|im_start|>assistant\n";
+    text += think ? "<think>\n" : "<think>\n\n</think>\n\n";
+    return text;
+}
+
+struct serve_state {
+    std::mutex                   mtx; // one generation at a time
+    coord_account                acc;
+    llama_model_ptr              vocab_model;
+    const llama_vocab *          vocab = nullptr;
+    std::string                  key;  // model key for the coordinator
+    std::string                  name; // model name for /v1/models
+    std::unique_ptr<draft_model> dm;
+    int32_t                      n_draft = 6;
+    uint32_t                     n_ctx   = 8192;
+    int                          spares  = 1;
+    std::string                  city;
+};
+
+static int cmd_serve(const cli_args & a) {
+    if (!a.has("--coordinator")) {
+        throw std::runtime_error("serve needs --coordinator URL");
+    }
+    auto st = std::make_shared<serve_state>();
+    model_opts mo = model_opts_from(a);
+    mo.vocab_only = true;
+    st->vocab_model = load_model(mo);
+    st->vocab   = llama_model_get_vocab(st->vocab_model.get());
+    st->key     = model_key(mo.path);
+    st->name    = st->key.substr(0, st->key.find(" #"));
+    st->n_ctx   = (uint32_t) a.get_int("-c", "--ctx-size", 8192);
+    st->spares  = a.get_int("--spares", "", 1);
+    st->city    = a.get("--city", "", "");
+    st->n_draft = a.get_int("--draft-max", "", 6);
+    st->acc     = account_from(a);
+    if (a.has("--draft")) {
+        model_opts dmo;
+        dmo.path         = a.get("--draft", "", "");
+        dmo.n_gpu_layers = a.get_int("-ngld", "--draft-ngl", 999);
+        dmo.device       = a.get("--device", "-dev", "");
+        st->dm = std::make_unique<draft_model>(dmo, st->n_ctx, a.get_int("-t", "--threads", common_cpu_get_num_math()));
+        if (st->dm->n_vocab != llama_vocab_n_tokens(st->vocab)) {
+            throw std::runtime_error("the draft model has another vocabulary than the model");
+        }
+    }
+    const payload hidden = gen_opts_from(a).hidden;
+
+    // special tokens of the reasoning, by id (they are single tokens in the Qwen vocabulary)
+    auto single = [&](const char * text) -> llama_token {
+        const auto t = common_tokenize(st->vocab, text, false, true);
+        return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
+    };
+    const llama_token tok_think = single("<think>"), tok_unthink = single("</think>");
+
+    httplib::Server http;
+    // only the app may call the API: a web page in a browser on this PC must not spend the points of the account.
+    // Requests from browsers carry Origin; the app's webview has one of these, curl and scripts have none
+    const std::set<std::string> origins = { "tauri://localhost", "http://tauri.localhost", "https://tauri.localhost",
+                                            "http://localhost:1420", "http://127.0.0.1:1420" };
+    http.set_pre_routing_handler([origins](const httplib::Request & req, httplib::Response & res) {
+        const std::string origin = req.get_header_value("Origin");
+        if (!origin.empty()) {
+            if (!origins.count(origin)) {
+                res.status = 403;
+                res.set_content("{\"error\":{\"message\":\"this origin may not use the agent API\"}}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            res.set_header("Access-Control-Allow-Origin", origin);
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            if (req.method == "OPTIONS") {
+                res.status = 204;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+    http.Get("/health", [](const httplib::Request &, httplib::Response & res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
+    http.Get("/v1/models", [st](const httplib::Request &, httplib::Response & res) {
+        json j = { { "object", "list" }, { "data", json::array({ { { "id", st->name }, { "object", "model" }, { "owned_by", "agent-p2p" } } }) } };
+        res.set_content(j.dump(), "application/json");
+    });
+    http.Get("/v1/account", [st](const httplib::Request &, httplib::Response & res) {
+        if (st->acc.token.empty()) {
+            res.status = 404;
+            res.set_content("{\"error\":{\"message\":\"no account\"}}", "application/json");
+            return;
+        }
+        const size_t p = st->acc.url.find("://");
+        const size_t sl = st->acc.url.find('/', p + 3);
+        httplib::Client cli(sl == std::string::npos ? st->acc.url : st->acc.url.substr(0, sl));
+        cli.set_connection_timeout(5);
+        auto r = cli.Get((sl == std::string::npos ? "" : st->acc.url.substr(sl)) + "/v1/accounts/me", st->acc.headers());
+        if (!r) {
+            res.status = 502;
+            res.set_content(json{ { "error", { { "message", "coordinator: " + httplib::to_string(r.error()) } } } }.dump(), "application/json");
+            return;
+        }
+        res.status = r->status;
+        res.set_content(r->body, "application/json");
+    });
+
+    http.Post("/v1/chat/completions", [st, hidden, tok_think, tok_unthink](const httplib::Request & req, httplib::Response & res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("messages") || !body["messages"].is_array()) {
+            res.status = 400;
+            res.set_content("{\"error\":{\"message\":\"messages are required\"}}", "application/json");
+            return;
+        }
+        const bool stream = body.value("stream", false);
+        const bool think  = body.value("think", true);
+        const std::vector<llama_token> prompt = common_tokenize(st->vocab, chat_prompt(body["messages"], think), true, true);
+        const int32_t room = (int32_t) st->n_ctx - (int32_t) prompt.size() - st->n_draft - 2;
+        if (room < 16) {
+            res.status = 400;
+            res.set_content("{\"error\":{\"message\":\"the conversation does not fit in the context\"}}", "application/json");
+            return;
+        }
+        const int32_t max_tokens = std::clamp(body.value("max_tokens", 2048), 1, room);
+        const std::string id = "chatcmpl-" + std::to_string((long long) (now_ms() * 1000));
+        const long long created = (long long) std::time(nullptr);
+
+        // runs the request; out(kind, text) gets "reasoning" / "content" pieces, false: stop
+        auto run = [st, hidden, prompt, max_tokens, think, tok_think, tok_unthink](
+                       const std::function<bool(const std::string &, const std::string &)> & out, json & usage, std::string & finish) {
+            std::lock_guard<std::mutex> lock(st->mtx);
+            const coord_chain c = request_chain(st->acc, st->key, st->spares, 3600, st->city);
+            chain_opts co;
+            co.nodes      = c.nodes;
+            co.spares     = c.spares;
+            co.session    = c.session;
+            co.tls        = true;
+            co.n_ctx      = st->n_ctx;
+            co.n_top      = 8;
+            co.hidden     = hidden;
+            co.n_rollback = st->dm ? (uint32_t) st->n_draft : 0;
+            chain_eval chain(co);
+            if (chain.parts[0].n_vocab != llama_vocab_n_tokens(st->vocab)) {
+                throw std::runtime_error("the tokenizer does not match the model of the chain");
+            }
+            gen_opts g;
+            g.n_gen  = max_tokens;
+            g.n_ctx  = st->n_ctx;
+            g.hidden = hidden;
+            bool in_think = think;
+            std::string pending;
+            bool stopped = false, ended = false;
+            g.on_token = [&](llama_token tok) {
+                if (llama_vocab_is_eog(st->vocab, tok)) {
+                    ended = true;
+                    return true;
+                }
+                if (tok == tok_think) {
+                    in_think = true;
+                    return true;
+                }
+                if (tok == tok_unthink) {
+                    if (!pending.empty() && !out("reasoning", pending)) {
+                        stopped = true;
+                        return false;
+                    }
+                    pending.clear();
+                    in_think = false;
+                    return true;
+                }
+                pending += common_token_to_piece(st->vocab, tok, false);
+                const size_t n = utf8_complete(pending);
+                if (n > 0) {
+                    if (!out(in_think ? "reasoning" : "content", pending.substr(0, n))) {
+                        stopped = true;
+                        return false;
+                    }
+                    pending.erase(0, n);
+                }
+                return true;
+            };
+            const gen_result r = st->dm ? generate_spec(chain, *st->dm, st->vocab, prompt, g, st->n_draft, 0.0, nullptr)
+                                        : generate(chain, st->vocab, prompt, g, nullptr);
+            if (!pending.empty() && !stopped) {
+                out(in_think ? "reasoning" : "content", pending);
+            }
+            long long charged = 0;
+            const long long balance = report_session(st->acc, c.session_hex, r.n_prompt, (int32_t) r.tokens.size(), &charged);
+            finish = ended ? "stop" : "length";
+            usage = { { "prompt_tokens", r.n_prompt }, { "completion_tokens", (int) r.tokens.size() },
+                      { "total_tokens", r.n_prompt + (int) r.tokens.size() } };
+            usage["agent"] = { { "session", c.session_hex }, { "points", charged }, { "balance", balance },
+                               { "tok_s", r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0 }, { "nodes", c.nodes.size() } };
+            AN_LOG("serve: %d + %zu tokens, %.2f tok/s, %lld points (balance %lld)\n", r.n_prompt, r.tokens.size(),
+                r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0, charged, balance);
+        };
+
+        if (!stream) {
+            std::string content, reasoning, finish;
+            json usage;
+            try {
+                run([&](const std::string & kind, const std::string & text) {
+                    (kind == "reasoning" ? reasoning : content) += text;
+                    return true;
+                }, usage, finish);
+            } catch (const std::exception & e) {
+                res.status = std::string(e.what()).find("not enough points") != std::string::npos ? 402 : 503;
+                res.set_content(json{ { "error", { { "message", e.what() } } } }.dump(), "application/json");
+                return;
+            }
+            json msg = { { "role", "assistant" }, { "content", content } };
+            if (!reasoning.empty()) {
+                msg["reasoning_content"] = reasoning;
+            }
+            json j = { { "id", id }, { "object", "chat.completion" }, { "created", created }, { "model", st->name },
+                       { "choices", json::array({ { { "index", 0 }, { "message", msg }, { "finish_reason", finish } } }) },
+                       { "usage", usage } };
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [st, run, id, created](size_t, httplib::DataSink & sink) {
+            auto send = [&](const json & j) {
+                const std::string line = "data: " + j.dump() + "\n\n";
+                return sink.write(line.data(), line.size());
+            };
+            auto chunk = [&](const json & delta, const json & finish) {
+                return json{ { "id", id }, { "object", "chat.completion.chunk" }, { "created", created }, { "model", st->name },
+                             { "choices", json::array({ { { "index", 0 }, { "delta", delta }, { "finish_reason", finish } } }) } };
+            };
+            send(chunk({ { "role", "assistant" } }, nullptr));
+            std::string finish;
+            json usage;
+            try {
+                run([&](const std::string & kind, const std::string & text) {
+                    return send(chunk({ { kind == "reasoning" ? "reasoning_content" : "content", text } }, nullptr));
+                }, usage, finish);
+                json last = chunk(json::object(), finish);
+                last["usage"] = usage;
+                send(last);
+            } catch (const std::exception & e) {
+                send({ { "error", { { "message", e.what() } } } });
+            }
+            const std::string done = "data: [DONE]\n\n";
+            sink.write(done.data(), done.size());
+            sink.done();
+            return true;
+        });
+    });
+
+    const std::string host = a.get("--host", "", "127.0.0.1");
+    const int port = a.get_int("--port", "", 8090);
+    if (!http.bind_to_port(host, port)) {
+        throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
+    }
+    printf("agent-node serve ready on http://%s:%d (model %s%s)\n", host.c_str(), port, st->name.c_str(), st->dm ? ", with a draft model" : "");
+    fflush(stdout);
+    http.listen_after_bind();
+    return 0;
+}
+
 static int cmd_reference(const cli_args & a) {
     const gen_opts g = gen_opts_from(a);
     model_opts mo = model_opts_from(a);
@@ -2562,6 +2875,8 @@ static void usage() {
         "                       [--hidden q8|f16|f32] [--force REFERENCE_DUMP]\n"
         "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]]   speculative decoding\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
+        "  agent-node serve     -m model.gguf --coordinator URL [--port 8090] [--draft DRAFT.gguf] [-c 8192] [--account FILE]\n"
+        "                       the local API of the agent (OpenAI-style /v1/chat/completions, reasoning in reasoning_content)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
@@ -2662,6 +2977,9 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "reference") {
             return cmd_reference(a);
+        }
+        if (cmd == "serve") {
+            return cmd_serve(a);
         }
         usage();
         return 2;
