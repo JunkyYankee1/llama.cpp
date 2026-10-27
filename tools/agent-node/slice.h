@@ -366,6 +366,7 @@ struct model_source {
     int32_t                 n_layer = 0;
     bool                    tied    = false; // no output.weight: the output head reuses token_embd
     std::vector<uint64_t>   layer_bytes;     // bytes of blk.N.* per layer
+    std::vector<uint64_t>   expert_bytes;    // of them, the experts of an MoE layer (ffn_*_exps): they can live in RAM
     uint64_t                embd_bytes   = 0; // token_embd
     uint64_t                output_bytes = 0; // output head and norm (token_embd again when tied)
     uint64_t                other_bytes  = 0; // the rest, every part loads it (e.g. rope frequencies)
@@ -390,6 +391,7 @@ struct model_source {
             throw std::runtime_error(where + ": no " + arch + ".block_count in the metadata");
         }
         layer_bytes.assign((size_t) n_layer, 0);
+        expert_bytes.assign((size_t) n_layer, 0);
         bool has_output = false;
         for (const auto & f : files) {
             for (int64_t i = 0; i < gguf_get_n_tensors(f.g); i++) {
@@ -398,6 +400,10 @@ struct model_source {
                 const tensor_role r = role_of(name);
                 if (r.layer >= 0 && r.layer < n_layer) {
                     layer_bytes[(size_t) r.layer] += size;
+                    const std::string n = name;
+                    if (n.find("_exps.") != std::string::npos && n.find(".ffn_") != std::string::npos) {
+                        expert_bytes[(size_t) r.layer] += size;
+                    }
                 } else if (r.embd) {
                     embd_bytes += size;
                 } else if (r.output) {

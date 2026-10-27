@@ -77,7 +77,7 @@ struct cli_args {
 
     static bool is_flag(const std::string & name) {
         return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose" ||
-               name == "--vocab-only";
+               name == "--vocab-only" || name == "--cpu-moe";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -107,7 +107,7 @@ struct cli_args {
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--every", "--rounds",
-            "--listen-host", "--listen-port", "--relay", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -172,6 +172,7 @@ struct model_opts {
     int32_t     n_gpu_layers = 999;
     std::string device;
     bool        vocab_only = false;
+    bool        cpu_moe    = false; // the experts of an MoE model in RAM, the rest on the GPU
 };
 
 static llama_model_ptr load_model(const model_opts & mo) {
@@ -180,6 +181,12 @@ static llama_model_ptr load_model(const model_opts & mo) {
     mp.layer_start  = mo.layer_start;
     mp.layer_end    = mo.layer_end;
     mp.vocab_only   = mo.vocab_only;
+
+    // the experts take most of an MoE layer and only a few of them work per token: in RAM a node holds more layers
+    static const llama_model_tensor_buft_override cpu_moe[] = { llm_ffn_exps_cpu_override(), { nullptr, nullptr } };
+    if (mo.cpu_moe && !mo.vocab_only) {
+        mp.tensor_buft_overrides = cpu_moe;
+    }
 
     std::vector<ggml_backend_dev_t> devs;
     if (!mo.device.empty() && !mo.vocab_only) {
@@ -210,6 +217,7 @@ static model_opts model_opts_from(const cli_args & a) {
     }
     mo.n_gpu_layers = a.get_int("-ngl", "--n-gpu-layers", 999);
     mo.device       = a.get("--device", "-dev", "");
+    mo.cpu_moe      = a.has("--cpu-moe");
     const std::string layers = a.get("--layers", "", "");
     if (!layers.empty()) {
         const size_t p = layers.find(':');
@@ -970,6 +978,20 @@ static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const st
             fmt_gb(total).c_str(), fmt_gb(vram).c_str());
     }
 
+    // RAM for the experts of an MoE model (--cpu-moe): the free memory minus 4 GB for the system, or --ram-gb
+    uint64_t ram = 0;
+    if (mo.cpu_moe) {
+        if (a.has("--ram-gb")) {
+            ram = (uint64_t) (std::stod(a.get("--ram-gb", "", "0")) * 1e9);
+        } else if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(cpu, &free, &total);
+            const uint64_t reserve = 4ull << 30;
+            ram = free > reserve ? free - reserve : 0;
+            AN_LOG("node: RAM %s free of %s, %s for the experts\n", fmt_gb(free).c_str(), fmt_gb(total).c_str(), fmt_gb(ram).c_str());
+        }
+    }
+
     // disk: what the participant gives, but no more than there is (slices of this model already here count as free)
     std::vector<slice_file> have = find_slices(dir, ms.key);
     uint64_t have_bytes = 0;
@@ -996,6 +1018,9 @@ static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const st
         { "output_bytes", ms.output_bytes },
         { "other_bytes", ms.other_bytes },
         { "vram_bytes", vram },
+        { "cpu_moe", mo.cpu_moe },
+        { "expert_bytes", ms.expert_bytes },
+        { "ram_bytes", ram },
         { "disk_bytes", disk },
         { "have", have_j },
         { "tls_fingerprint", fingerprint },
@@ -1286,6 +1311,7 @@ static int cmd_node(const cli_args & a) {
     if (assigned) {
         srv.mo.n_gpu_layers = a.get_int("-ngl", "--n-gpu-layers", 999);
         srv.mo.device       = a.get("--device", "-dev", "");
+        srv.mo.cpu_moe      = a.has("--cpu-moe");
     } else {
         srv.mo = model_opts_from(a);
     }
@@ -3536,6 +3562,7 @@ static void usage() {
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "                  [--relay off|auto|only]  behind NAT: reachable through the relay of the network\n"
+        "      node|verify [--cpu-moe [--ram-gb N]]  the experts of an MoE model in RAM, the rest on the GPU\n"
         "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
         "                  instead of -m and --layers: the coordinator assigns the layers, the node downloads only them\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
