@@ -32,6 +32,9 @@
 
 #ifdef _WIN32
 #    include <mstcpip.h> // SIO_UDP_CONNRESET
+#    ifndef SIO_UDP_CONNRESET
+#        define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#    endif
 #endif
 
 namespace agent {
