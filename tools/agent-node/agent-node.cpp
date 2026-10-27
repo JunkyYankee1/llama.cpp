@@ -105,7 +105,7 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
-            "--account", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--account", "--parent-pid", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -2494,7 +2494,15 @@ static int cmd_serve(const cli_args & a) {
         const size_t sl = st->acc.url.find('/', p + 3);
         httplib::Client cli(sl == std::string::npos ? st->acc.url : st->acc.url.substr(0, sl));
         cli.set_connection_timeout(5);
-        auto r = cli.Get((sl == std::string::npos ? "" : st->acc.url.substr(sl)) + "/v1/accounts/me", st->acc.headers());
+        const std::string path = (sl == std::string::npos ? "" : st->acc.url.substr(sl)) + "/v1/accounts/me";
+        auto r = cli.Get(path, st->acc.headers());
+        if (r && r->status == 401) {
+            // the coordinator forgot the account (restarted with the in-memory store): a new one
+            std::lock_guard<std::mutex> lock(st->mtx);
+            if (st->acc.load_or_create(true)) {
+                r = cli.Get(path, st->acc.headers());
+            }
+        }
         if (!r) {
             res.status = 502;
             res.set_content(json{ { "error", { { "message", "coordinator: " + httplib::to_string(r.error()) } } } }.dump(), "application/json");
@@ -2866,6 +2874,26 @@ static int cmd_devices() {
     return 0;
 }
 
+static void watch_parent(unsigned long pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD) pid);
+    if (h == nullptr) {
+        exit(3); // the app is already gone
+    }
+    std::thread([h]() {
+        WaitForSingleObject(h, INFINITE);
+        _exit(0);
+    }).detach();
+#else
+    std::thread([pid]() {
+        while (getppid() == (pid_t) pid) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        _exit(0);
+    }).detach();
+#endif
+}
+
 static void usage() {
     fprintf(stderr,
         "usage:\n"
@@ -2942,6 +2970,10 @@ int main(int argc, char ** argv) {
     const std::string cmd = argv[1];
     try {
         cli_args a(argc, argv, 2);
+        // started by the app: exit together with it, even when it crashes (a left-over node or API would hold the port)
+        if (a.has("--parent-pid")) {
+            watch_parent(std::stoul(a.get("--parent-pid", "", "0")));
+        }
         if (cmd == "compare") {
             return cmd_compare(a);
         }
