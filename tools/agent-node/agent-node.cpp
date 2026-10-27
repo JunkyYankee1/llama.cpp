@@ -845,6 +845,7 @@ static std::function<void(const slice_progress &)> download_printer() {
 
 // the full model by URL; a failing huggingface.co URL is retried through the mirror
 static void open_model_source(model_source & ms, const std::string & url, const std::string & mirror) {
+    std::string first_err;
     try {
         ms.open(url);
         return;
@@ -853,6 +854,7 @@ static void open_model_source(model_source & ms, const std::string & url, const 
         if (mirror.empty() || url.rfind(hf, 0) != 0) {
             throw;
         }
+        first_err = e.what();
         AN_LOG("warning: %s; trying %s\n", e.what(), mirror.c_str());
     }
     std::string m = mirror;
@@ -860,7 +862,12 @@ static void open_model_source(model_source & ms, const std::string & url, const 
         m.pop_back();
     }
     ms = model_source();
-    ms.open(m + url.substr(std::string("https://huggingface.co").size()));
+    try {
+        ms.open(m + url.substr(std::string("https://huggingface.co").size()));
+    } catch (const std::exception & e) {
+        // both errors: the one of Hugging Face is usually the telling one
+        throw std::runtime_error(first_err + "; the mirror: " + e.what());
+    }
 }
 
 struct slice_file {
