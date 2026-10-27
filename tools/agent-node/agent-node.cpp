@@ -106,7 +106,7 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
-            "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--every", "--rounds",
+            "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
@@ -3004,7 +3004,8 @@ struct probe_result {
     std::string detail;
 };
 
-static probe_result run_probe(llama_model * model, const json & pr, void * cctx, void * sctx, const std::string & listen_host, int listen_port,
+static probe_result run_probe(llama_model * model, const json & pr, void * cctx, void * sctx, const std::string & bind_host,
+                              const std::string & listen_host, int listen_port,
                               const std::string & fingerprint, std::mt19937 & rng) {
     const json & node = pr.at("node");
     const std::string addr  = node.at("addr").get<std::string>();
@@ -3040,7 +3041,7 @@ static probe_result run_probe(llama_model * model, const json & pr, void * cctx,
     std::unique_ptr<tcp_listener> ln;
     std::thread next_thread;
     if (!last) {
-        ln = std::make_unique<tcp_listener>(listen_host, listen_port);
+        ln = std::make_unique<tcp_listener>(bind_host, listen_port);
         next_thread = std::thread([&]() {
             try {
                 tcp_conn_ptr c = ln->accept();
@@ -3264,6 +3265,8 @@ static int cmd_verify(const cli_args & a) {
     SSL_CTX * cctx = tls_client_ctx();
     const std::string host = a.get("--listen-host", "", "127.0.0.1");
     const int port = a.get_int("--listen-port", "", 50190);
+    // in a container the checker listens on 0.0.0.0 but the nodes reach it at the public host
+    const std::string bind = a.get("--bind-host", "", host);
     const int every = a.get_int("--every", "", 60);
     const int rounds = a.get_int("--rounds", "", 0); // 0: forever
     std::mt19937 rng(std::random_device{}());
@@ -3285,7 +3288,7 @@ static int cmd_verify(const cli_args & a) {
             }
             probe_result res;
             try {
-                res = run_probe(model.get(), pr.body, cctx, sctx, host, port, identity.fingerprint(), rng);
+                res = run_probe(model.get(), pr.body, cctx, sctx, bind, host, port, identity.fingerprint(), rng);
             } catch (const std::exception & e) {
                 // a node that breaks the session is not caught: it may be a network failure; the next probe repeats
                 AN_LOG("verify: node %s: %s (no verdict)\n", pr.body["node"].value("addr", "").c_str(), e.what());
@@ -3544,7 +3547,7 @@ static void usage() {
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node serve     -m model.gguf --coordinator URL [--port 8090] [--draft DRAFT.gguf] [-c 8192] [--account FILE]\n"
         "                       the local API of the agent (OpenAI-style /v1/chat/completions, reasoning in reasoning_content)\n"
-        "  agent-node verify    -m whole-model.gguf --coordinator URL --verifier-token T [--every 60] [--listen-host H --listen-port 50190]\n"
+        "  agent-node verify    -m whole-model.gguf --coordinator URL --verifier-token T [--every 60] [--listen-host H --listen-port 50190 --bind-host 0.0.0.0]\n"
         "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
