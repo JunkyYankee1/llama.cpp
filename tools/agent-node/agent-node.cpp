@@ -106,7 +106,8 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
-            "--account", "--parent-pid", "--chat-template", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--every", "--rounds",
+            "--listen-host", "--listen-port", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -483,6 +484,8 @@ struct node_server {
         return !sessions.empty();
     }
 
+    float corrupt = 0; // --test-corrupt: a dishonest node for the tests of the verifier (noise in the outputs)
+
     std::vector<uint8_t> key;                 // secret key: open and attach need an access token; empty: open node (tests)
     void *               server_ctx = nullptr; // SSL_CTX of incoming connections, null: plain TCP
     void *               client_ctx = nullptr; // SSL_CTX of the connection to the next node
@@ -657,6 +660,18 @@ struct node_server {
         }
         s->st.compute_ms += now_ms() - t0;
         s->st.output_ms  += p.last_output_ms;
+        if (corrupt > 0) {
+            // a node that saves work: its outputs are partly made up
+            static thread_local std::mt19937 rng(7);
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            for (auto & v : hidden) {
+                v = (1.0f - corrupt) * v + corrupt * nd(rng) * std::max(1e-3f, std::fabs(v) + 0.5f);
+            }
+            for (auto & e : top) {
+                e.logit += corrupt * 10.0f * nd(rng);
+            }
+            std::sort(top.begin(), top.end(), [](const top_entry & x, const top_entry & y) { return x.logit > y.logit; });
+        }
 
         if (!p.is_last()) {
             forward_hdr out = h;
@@ -1040,6 +1055,40 @@ struct node_ref {
     std::string pin;   // expected certificate fingerprint ("" = not checked)
 };
 
+// the identity of this PC for the coordinator: the welcome points go only to the first account of a PC.
+// sha256 of the machine id (Windows MachineGuid, Linux /etc/machine-id); "" when unknown
+static std::string device_hash() {
+    std::string id;
+#ifdef _WIN32
+    char buf[128];
+    DWORD sz = sizeof(buf);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", "MachineGuid", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                     nullptr, buf, &sz) == ERROR_SUCCESS) {
+        id = buf;
+    }
+#else
+    std::ifstream f("/etc/machine-id");
+    std::getline(f, id);
+#endif
+    if (id.empty()) {
+        return "";
+    }
+#ifdef AGENT_HAVE_TLS
+    const std::string m = "agent-device|" + id;
+    uint8_t md[32];
+    SHA256((const uint8_t *) m.data(), m.size(), md);
+    static const char * hex = "0123456789abcdef";
+    std::string out;
+    for (uint8_t b : md) {
+        out += hex[b >> 4];
+        out += hex[b & 15];
+    }
+    return out;
+#else
+    return "";
+#endif
+}
+
 //
 // the account of this PC at the coordinator: the owner of a node gets points, a client spends them
 //
@@ -1062,7 +1111,11 @@ struct coord_account {
         if (!token.empty() && !renew) {
             return true;
         }
-        const http_reply r = coord_post(url, "/v1/accounts", json::object());
+        json body = json::object();
+        if (const std::string d = device_hash(); !d.empty()) {
+            body["device"] = d;
+        }
+        const http_reply r = coord_post(url, "/v1/accounts", body);
         if (r.status == 404) {
             token.clear();
             return false;
@@ -1182,6 +1235,7 @@ static int cmd_node(const cli_args & a) {
         srv.mo = model_opts_from(a);
     }
     srv.n_threads = a.get_int("-t", "--threads", common_cpu_get_num_math());
+    srv.corrupt   = std::stof(a.get("--test-corrupt", "", "0"));
 
     const std::string host = a.get("--host", "", "127.0.0.1");
     const int         port = a.get_int("--port", "", 50152);
@@ -1341,6 +1395,9 @@ static int cmd_node(const cli_args & a) {
         };
         if (a.has("--disk-gb")) {
             link.reg["disk_gb"] = std::stod(a.get("--disk-gb", "", "0"));
+        }
+        if (const std::string d = device_hash(); !d.empty()) {
+            link.reg["device"] = d; // a PC caught returning wrong results cannot come back with a new account
         }
         // the owner of this node gets the points for its work
         static coord_account acc;
@@ -2749,6 +2806,410 @@ static int cmd_serve(const cli_args & a) {
     return 0;
 }
 
+//
+// verify: the checker of the network. It holds the whole model, takes a session to a node from the coordinator
+// (the same as a client gets) and plays the client, the previous node and the next node of that session: the node
+// sees ordinary work. The input is a short text (or, for a node in the middle, the hidden states of the whole model
+// before the layers of the node, in int8 as on the network), the output is compared with the whole model.
+// A node that returns made-up results is banned by the coordinator.
+//
+
+struct probe_ref {
+    std::vector<llama_token> tokens;
+    std::vector<float>       in;     // hidden states before layer a, per token (empty for a = 0)
+    std::vector<float>       out;    // hidden states after layer b - 1 (empty for the last part)
+    std::vector<float>       logits; // per token (the last part)
+    int32_t                  n_embd = 0, n_vocab = 0;
+};
+
+static probe_ref probe_reference(llama_model * model, const std::vector<llama_token> & tokens, int32_t a, int32_t b) {
+    probe_ref ref;
+    ref.tokens  = tokens;
+    ref.n_embd  = llama_model_n_embd(model);
+    ref.n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int32_t n_layer = llama_model_n_layer(model);
+    struct cap_t {
+        std::string want_in, want_out;
+        std::vector<float> * in;
+        std::vector<float> * out;
+    } cap{ a > 0 ? "l_out-" + std::to_string(a - 1) : "", b < n_layer ? "l_out-" + std::to_string(b - 1) : "", &ref.in, &ref.out };
+    auto cb = [](ggml_tensor * t, bool ask, void * ud) -> bool {
+        auto & c = *(cap_t *) ud;
+        const bool hit = t->name == c.want_in || t->name == c.want_out;
+        if (ask) {
+            return hit;
+        }
+        if (hit && t->type == GGML_TYPE_F32) {
+            std::vector<float> & dst = t->name == c.want_in ? *c.in : *c.out;
+            dst.resize((size_t) ggml_nelements(t));
+            ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+        }
+        return true;
+    };
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx              = (uint32_t) tokens.size() + 16;
+    cp.n_batch            = (uint32_t) tokens.size();
+    cp.n_ubatch           = (uint32_t) tokens.size();
+    cp.n_seq_max          = 1;
+    cp.no_perf            = true;
+    cp.cb_eval            = cb;
+    cp.cb_eval_user_data  = &cap;
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    if (!ctx) {
+        throw std::runtime_error("verify: cannot create a context of the whole model");
+    }
+    common_batch batch(ctx.get());
+    for (size_t i = 0; i < tokens.size(); i++) {
+        batch.add(tokens[i], (int32_t) i, 0, true);
+    }
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("verify: the whole model failed on the probe");
+    }
+    if (b == n_layer) {
+        ref.logits.resize(tokens.size() * (size_t) ref.n_vocab);
+        for (size_t i = 0; i < tokens.size(); i++) {
+            memcpy(ref.logits.data() + i * ref.n_vocab, llama_get_logits_ith(ctx.get(), (int32_t) i), sizeof(float) * ref.n_vocab);
+        }
+    }
+    if ((a > 0 && ref.in.size() != tokens.size() * ref.n_embd) || (b < n_layer && ref.out.size() != tokens.size() * ref.n_embd)) {
+        throw std::runtime_error("verify: the hidden states of the whole model were not captured");
+    }
+    return ref;
+}
+
+static double cosine(const float * x, const float * y, int32_t n, double * rel_err) {
+    double xy = 0, xx = 0, yy = 0, dd = 0;
+    for (int32_t i = 0; i < n; i++) {
+        xy += (double) x[i] * y[i];
+        xx += (double) x[i] * x[i];
+        yy += (double) y[i] * y[i];
+        dd += ((double) x[i] - y[i]) * ((double) x[i] - y[i]);
+    }
+    if (rel_err) {
+        *rel_err = std::sqrt(dd / std::max(yy, 1e-30));
+    }
+    return xy / std::sqrt(std::max(xx * yy, 1e-30));
+}
+
+// texts of the probes: ordinary requests, so that a probe looks like work
+static const char * PROBE_TEXTS[] = {
+    "Помоги написать письмо коллеге о переносе встречи на четверг.",
+    "Explain the difference between a process and a thread in simple words.",
+    "Как приготовить сырники, чтобы они не разваливались?",
+    "Write a Python function that checks whether a string is a palindrome.",
+    "Почему небо голубое? Объясни коротко.",
+    "Summarize the main idea of the theory of relativity in three sentences.",
+    "Составь план тренировок на неделю для начинающего бегуна.",
+    "What are the pros and cons of remote work for a small team?",
+};
+
+struct probe_result {
+    bool        passed = false;
+    std::string detail;
+};
+
+static probe_result run_probe(llama_model * model, const json & pr, void * cctx, void * sctx, const std::string & listen_host, int listen_port,
+                              const std::string & fingerprint, std::mt19937 & rng) {
+    const json & node = pr.at("node");
+    const std::string addr  = node.at("addr").get<std::string>();
+    const std::string pin   = node.at("pin").get<std::string>();
+    const std::string token = node.at("token").get<std::string>();
+    const int32_t a = node.at("layer_start").get<int32_t>(), b = node.at("layer_end").get<int32_t>();
+    const int32_t n_layer = llama_model_n_layer(model);
+    const uint64_t session = std::stoull(pr.at("session").get<std::string>(), nullptr, 16);
+    const bool first = a == 0, last = b == n_layer;
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // the probe: a chat prompt plus a few "generated" tokens, as a client would send them
+    const std::string text = PROBE_TEXTS[rng() % (sizeof(PROBE_TEXTS) / sizeof(PROBE_TEXTS[0]))];
+    std::vector<llama_token> tokens = common_tokenize(vocab, "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n", true, true);
+    const int n_steps = 4;
+    {
+        // the continuation of the whole model, greedy: the steps of a generation
+        probe_ref r0 = probe_reference(model, tokens, 0, n_layer);
+        for (int i = 0; i < n_steps; i++) {
+            const float * lg = r0.logits.data() + (tokens.size() - 1) * r0.n_vocab;
+            tokens.push_back((llama_token) (std::max_element(lg, lg + r0.n_vocab) - lg));
+            r0 = probe_reference(model, tokens, 0, n_layer);
+        }
+    }
+    const probe_ref ref = probe_reference(model, tokens, a, b);
+    const int32_t n_embd = ref.n_embd;
+    const size_t n_prefill = tokens.size() - n_steps;
+
+    // the next node of the session: this checker, listening for the node to attach
+    std::vector<float> got;  // hidden states the node sent on, per token
+    std::mutex got_mtx;
+    std::atomic<bool> listen_err{ false };
+    std::unique_ptr<tcp_listener> ln;
+    std::thread next_thread;
+    if (!last) {
+        ln = std::make_unique<tcp_listener>(listen_host, listen_port);
+        next_thread = std::thread([&]() {
+            try {
+                tcp_conn_ptr c = ln->accept();
+                if (!c) {
+                    listen_err = true;
+                    return;
+                }
+#ifdef AGENT_HAVE_TLS
+                if (!c->tls_handshake((SSL_CTX *) sctx, true).empty()) {
+                    listen_err = true;
+                    return;
+                }
+#endif
+                msg type;
+                std::vector<uint8_t> body;
+                while (recv_frame(*c, type, body)) {
+                    if (type != msg::forward) {
+                        continue; // attach
+                    }
+                    reader r(body.data(), body.size());
+                    const forward_hdr h = forward_hdr::read(r);
+                    const uint8_t * data = r.get_bytes(payload_size(h.kind, h.n_tokens, n_embd));
+                    std::vector<float> rows((size_t) h.n_tokens * n_embd);
+                    if (h.kind == payload::q8) {
+                        ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(data, rows.data(), (int64_t) rows.size());
+                    } else if (h.kind == payload::f16) {
+                        ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, rows.data(), (int64_t) rows.size());
+                    } else if (h.kind == payload::f32) {
+                        memcpy(rows.data(), data, rows.size() * sizeof(float));
+                    }
+                    std::lock_guard<std::mutex> lock(got_mtx);
+                    got.insert(got.end(), rows.begin(), rows.end());
+                }
+            } catch (const std::exception &) {
+                listen_err = true;
+            }
+        });
+    }
+    struct joiner {
+        std::thread & t;
+        std::unique_ptr<tcp_listener> & l;
+        ~joiner() {
+            if (t.joinable()) {
+                l.reset(); // closes the socket, accept returns
+                t.detach();
+            }
+        }
+    } join_guard{ next_thread, ln };
+
+    // the client of the session
+    tcp_conn_ptr client = secure_connect(addr, cctx, pin);
+    open_msg om;
+    om.session = session;
+    om.n_ctx   = 1024;
+    om.n_top   = 8;
+    om.hidden  = payload::q8;
+    om.token   = token;
+    if (!last) {
+        om.next       = listen_host + ":" + std::to_string(listen_port);
+        om.next_token = std::to_string(rng()) + std::to_string(rng());
+        om.next_pin   = fingerprint;
+    }
+    if (!send_frame(*client, msg::open, om.write())) {
+        throw std::runtime_error("the node closed the connection");
+    }
+    auto expect = [](tcp_conn & c, msg want) {
+        msg type;
+        std::vector<uint8_t> body;
+        if (!recv_frame(c, type, body)) {
+            throw std::runtime_error("the node closed the connection");
+        }
+        if (type == msg::error) {
+            reader r(body.data(), body.size());
+            throw std::runtime_error("the node: " + r.get_str());
+        }
+        if (type != want) {
+            throw std::runtime_error("unexpected frame from the node");
+        }
+        return body;
+    };
+    expect(*client, msg::open_ok);
+
+    // the previous node of the session (or the client itself for the first part)
+    tcp_conn_ptr in = client;
+    if (!first) {
+        in = secure_connect(addr, cctx, pin);
+        attach_msg am;
+        am.session = session;
+        am.token   = token;
+        send_frame(*in, msg::attach, am.write());
+    }
+    auto send_forward = [&](size_t pos0, size_t n, uint32_t step) {
+        forward_hdr h;
+        h.session  = session;
+        h.step     = step;
+        h.pos0     = (int32_t) pos0;
+        h.n_tokens = (uint32_t) n;
+        h.kind     = first ? payload::tokens : payload::q8;
+        writer w;
+        h.write(w);
+        if (first) {
+            w.put_bytes(tokens.data() + pos0, n * sizeof(llama_token));
+        } else {
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->from_float_ref(ref.in.data() + pos0 * n_embd,
+                w.grow(payload_size(payload::q8, (uint32_t) n, n_embd)), (int64_t) n * n_embd);
+        }
+        if (!send_frame(*in, msg::forward, w)) {
+            throw std::runtime_error("the node closed the connection");
+        }
+    };
+    std::vector<std::vector<top_entry>> tops; // the last part: top-k per checked position
+    std::vector<size_t> top_pos;
+    uint32_t step = 0;
+    send_forward(0, n_prefill, step++);
+    if (last) {
+        auto body = expect(*client, msg::result);
+        reader r(body.data(), body.size());
+        const result_msg rm = result_msg::read(r);
+        tops.push_back(rm.top);
+        top_pos.push_back(n_prefill - 1);
+    }
+    for (size_t i = n_prefill; i < tokens.size(); i++) {
+        send_forward(i, 1, step++);
+        if (last) {
+            auto body = expect(*client, msg::result);
+            reader r(body.data(), body.size());
+            const result_msg rm = result_msg::read(r);
+            tops.push_back(rm.top);
+            top_pos.push_back(i);
+        }
+    }
+    if (!last) {
+        // wait for the outputs of all tokens
+        for (int i = 0; i < 300; i++) {
+            {
+                std::lock_guard<std::mutex> lock(got_mtx);
+                if (got.size() >= tokens.size() * n_embd) {
+                    break;
+                }
+            }
+            if (listen_err) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    writer cw;
+    cw.put<uint64_t>(session);
+    send_frame(*client, msg::close, cw);
+    client->close();
+    if (in != client) {
+        in->close();
+    }
+
+    probe_result res;
+    char buf[256];
+    if (!last) {
+        std::lock_guard<std::mutex> lock(got_mtx);
+        if (got.size() < tokens.size() * n_embd) {
+            res.detail = "the node sent " + std::to_string(got.size() / n_embd) + " of " + std::to_string(tokens.size()) + " outputs";
+            return res;
+        }
+        double min_cos = 1, max_err = 0;
+        for (size_t t = 0; t < tokens.size(); t++) {
+            double err = 0;
+            const double c = cosine(got.data() + t * n_embd, ref.out.data() + t * n_embd, n_embd, &err);
+            min_cos = std::min(min_cos, c);
+            max_err = std::max(max_err, err);
+        }
+        res.passed = min_cos >= 0.98 && max_err <= 0.25;
+        snprintf(buf, sizeof(buf), "layers %d:%d, %zu tokens, cosine >= %.5f, relative error <= %.4f", a, b, tokens.size(), min_cos, max_err);
+    } else {
+        int same = 0;
+        double max_rel = 0;
+        for (size_t k = 0; k < tops.size(); k++) {
+            const float * lg = ref.logits.data() + top_pos[k] * ref.n_vocab;
+            const float mx = *std::max_element(lg, lg + ref.n_vocab);
+            float scale = 1e-6f;
+            for (int32_t v = 0; v < ref.n_vocab; v++) {
+                scale = std::max(scale, std::fabs(lg[v]));
+            }
+            const llama_token best = (llama_token) (std::max_element(lg, lg + ref.n_vocab) - lg);
+            same += !tops[k].empty() && tops[k][0].id == best;
+            for (const auto & e : tops[k]) {
+                if (e.id >= 0 && e.id < ref.n_vocab) {
+                    max_rel = std::max(max_rel, (double) std::fabs(e.logit - lg[e.id]) / scale);
+                }
+            }
+            (void) mx;
+        }
+        res.passed = same * 4 >= (int) tops.size() * 3 && max_rel <= 0.1;
+        snprintf(buf, sizeof(buf), "layers %d:%d (last), same top-1 %d of %zu, logit error <= %.4f", a, b, same, tops.size(), max_rel);
+    }
+    res.detail = buf;
+    return res;
+}
+
+static int cmd_verify(const cli_args & a) {
+    const std::string url = a.get("--coordinator", "", "");
+    std::string vtok = a.get("--verifier-token", "", "");
+    if (vtok.empty()) {
+        if (const char * e = getenv("VERIFIER_TOKEN")) {
+            vtok = e;
+        }
+    }
+    if (url.empty() || vtok.empty()) {
+        throw std::runtime_error("verify needs --coordinator URL and --verifier-token (or env VERIFIER_TOKEN)");
+    }
+#ifndef AGENT_HAVE_TLS
+    require_tls("verify");
+    return 1;
+#else
+    model_opts mo = model_opts_from(a);
+    mo.layer_start = 0;
+    mo.layer_end   = 0;
+    llama_model_ptr model = load_model(mo);
+    const std::string key = model_key(mo.path);
+    tls_identity identity;
+    identity.load_or_create(a.get("--identity", "", "verifier.pem"));
+    SSL_CTX * sctx = tls_server_ctx(identity);
+    SSL_CTX * cctx = tls_client_ctx();
+    const std::string host = a.get("--listen-host", "", "127.0.0.1");
+    const int port = a.get_int("--listen-port", "", 50190);
+    const int every = a.get_int("--every", "", 60);
+    const int rounds = a.get_int("--rounds", "", 0); // 0: forever
+    std::mt19937 rng(std::random_device{}());
+    const httplib::Headers auth = { { "Authorization", "Bearer " + vtok } };
+    printf("agent-node verify: model %s, checks every %d s, the nodes reach this checker at %s:%d\n", key.c_str(), every, host.c_str(), port);
+    fflush(stdout);
+    for (int round = 0; rounds == 0 || round < rounds; round++) {
+        if (round > 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(every));
+        }
+        try {
+            const http_reply pr = coord_post(url, "/v1/verify/probe", { { "model", key } }, auth);
+            if (pr.status == 404) {
+                AN_LOG("verify: no node online\n");
+                continue;
+            }
+            if (pr.status != 200) {
+                throw std::runtime_error("probe refused: " + pr.error());
+            }
+            probe_result res;
+            try {
+                res = run_probe(model.get(), pr.body, cctx, sctx, host, port, identity.fingerprint(), rng);
+            } catch (const std::exception & e) {
+                // a node that breaks the session is not caught: it may be a network failure; the next probe repeats
+                AN_LOG("verify: node %s: %s (no verdict)\n", pr.body["node"].value("addr", "").c_str(), e.what());
+                continue;
+            }
+            const http_reply rr = coord_post(url, "/v1/verify/result",
+                { { "session", pr.body["session"] }, { "passed", res.passed }, { "detail", res.detail } }, auth);
+            printf("agent-node verify: node %s %s: %s%s\n", pr.body["node"].value("id", "").c_str(), res.passed ? "passed" : "FAILED",
+                res.detail.c_str(), rr.status == 204 ? "" : (" (the coordinator: " + rr.error() + ")").c_str());
+            fflush(stdout);
+        } catch (const std::exception & e) {
+            AN_LOG("warning: verify: %s\n", e.what());
+        }
+    }
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return 0;
+#endif
+}
+
 static int cmd_reference(const cli_args & a) {
     const gen_opts g = gen_opts_from(a);
     model_opts mo = model_opts_from(a);
@@ -2987,6 +3448,8 @@ static void usage() {
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node serve     -m model.gguf --coordinator URL [--port 8090] [--draft DRAFT.gguf] [-c 8192] [--account FILE]\n"
         "                       the local API of the agent (OpenAI-style /v1/chat/completions, reasoning in reasoning_content)\n"
+        "  agent-node verify    -m whole-model.gguf --coordinator URL --verifier-token T [--every 60] [--listen-host H --listen-port 50190]\n"
+        "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
@@ -3094,6 +3557,9 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "serve") {
             return cmd_serve(a);
+        }
+        if (cmd == "verify") {
+            return cmd_verify(a);
         }
         usage();
         return 2;

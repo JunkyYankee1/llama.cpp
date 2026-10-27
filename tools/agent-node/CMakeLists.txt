@@ -6,6 +6,6 @@ endif()
 target_link_libraries(${TARGET} PRIVATE llama-common llama cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 # cpp-httplib brings OpenSSL / BoringSSL for TLS and access tokens
 if (WIN32)
-    target_link_libraries(${TARGET} PRIVATE ws2_32 shell32)
+    target_link_libraries(${TARGET} PRIVATE ws2_32 shell32 advapi32)
 endif()
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

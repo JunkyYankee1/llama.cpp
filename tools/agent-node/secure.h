@@ -19,6 +19,7 @@
 #ifdef AGENT_HAVE_TLS
 #    include <openssl/crypto.h>
 #    include <openssl/hmac.h>
+#    include <openssl/sha.h>
 #    include <openssl/pem.h>
 #    include <openssl/rand.h>
 #endif
