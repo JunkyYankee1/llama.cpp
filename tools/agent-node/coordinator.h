@@ -2,7 +2,10 @@
 //
 // node:   POST /v1/nodes                 registration: address, certificate fingerprint, secret key, layer range
 //         POST /v1/nodes/{id}/heartbeat  every few seconds, signed with the key, with the number of open sessions
+//         POST /v1/assign                a node without a model asks which layers to hold
 // client: POST /v1/chains                a chain for one session: addresses, pins and access tokens, plus spares
+//         POST /v1/sessions/{id}/report  after the answer: how many tokens, the account pays for them
+// both:   POST /v1/accounts              a new account (the owner of a node gets points, a client spends them)
 #pragma once
 
 #include "secure.h"
@@ -78,6 +81,10 @@ struct coord_link {
     json                     reg;      // the registration body
     std::vector<uint8_t>     key;
     std::function<int()>     sessions; // open sessions now
+    std::function<json()>    work;     // tokens per session that went through the node (for the points of the owner)
+    // the coordinator does not know the account of the registration (restarted with the in-memory store):
+    // make a new one and put its token into reg; false: no account
+    std::function<bool()>    renew_account;
     std::atomic<bool>        stop{ false };
 
     void run() {
@@ -89,7 +96,10 @@ struct coord_link {
             int wait_s = interval_s;
             try {
                 if (id.empty()) {
-                    const http_reply r = coord_post(url, "/v1/nodes", reg);
+                    http_reply r = coord_post(url, "/v1/nodes", reg);
+                    if (r.status == 401 && r.error().find("account") != std::string::npos && renew_account && renew_account()) {
+                        r = coord_post(url, "/v1/nodes", reg);
+                    }
                     if (r.status != 200) {
                         throw std::runtime_error("registration refused: " + r.error());
                     }
@@ -107,7 +117,11 @@ struct coord_link {
 #else
                     const httplib::Headers h;
 #endif
-                    const http_reply r = coord_post(url, "/v1/nodes/" + id + "/heartbeat", json{ { "sessions", sessions() } }, h);
+                    json beat = { { "sessions", sessions() } };
+                    if (work) {
+                        beat["work"] = work();
+                    }
+                    const http_reply r = coord_post(url, "/v1/nodes/" + id + "/heartbeat", beat, h);
                     if (r.status == 404) {
                         fprintf(stderr, "agent-node: the coordinator does not know node %s, registering again\n", id.c_str());
                         id.clear();

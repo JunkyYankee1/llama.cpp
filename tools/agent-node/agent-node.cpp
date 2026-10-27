@@ -104,7 +104,7 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
-            "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--account", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -501,6 +501,40 @@ struct node_server {
     std::mutex                                     mtx;
     std::map<uint64_t, std::shared_ptr<session>>   sessions;
 
+    // tokens per session that went through this node, for the coordinator (points of the owner):
+    // kept for a while after the session closes, so that the last heartbeat counts them too
+    struct work_item {
+        int64_t tokens = 0;
+        double  last_ms = 0;
+    };
+    std::mutex                    work_mtx;
+    std::map<uint64_t, work_item> work;
+
+    void count_work(uint64_t session, int64_t n_tokens) {
+        std::lock_guard<std::mutex> lock(work_mtx);
+        work_item & w = work[session];
+        w.tokens += n_tokens;
+        w.last_ms = now_ms();
+    }
+
+    // [{"session": "<16 hex>", "tokens": N}] of the last 15 minutes
+    json work_json() {
+        std::lock_guard<std::mutex> lock(work_mtx);
+        json out = json::array();
+        const double t = now_ms();
+        for (auto it = work.begin(); it != work.end();) {
+            if (t - it->second.last_ms > 15 * 60 * 1000.0) {
+                it = work.erase(it);
+                continue;
+            }
+            char hex[17];
+            snprintf(hex, sizeof(hex), "%016" PRIx64, it->first);
+            out.push_back({ { "session", hex }, { "tokens", it->second.tokens } });
+            ++it;
+        }
+        return out;
+    }
+
     std::shared_ptr<session> find(uint64_t id) {
         std::lock_guard<std::mutex> lock(mtx);
         auto it = sessions.find(id);
@@ -604,6 +638,7 @@ struct node_server {
         s->st.bytes_in += 5 + body.size();
         s->st.n_tokens += h.n_tokens;
         s->st.n_forward++;
+        count_work(h.session, h.n_tokens);
 
         static thread_local std::vector<float>     hidden;
         static thread_local std::vector<top_entry> top;
@@ -988,6 +1023,143 @@ static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const st
 
 static std::string model_key(const std::string & path);
 
+// one node of the chain as the client knows it
+struct node_ref {
+    std::string addr;
+    std::string key;   // secret key of the node, to issue tokens itself (tests; normally the coordinator issues them)
+    std::string token; // access token issued by the coordinator for the session
+    std::string pin;   // expected certificate fingerprint ("" = not checked)
+};
+
+//
+// the account of this PC at the coordinator: the owner of a node gets points, a client spends them
+//
+
+struct coord_account {
+    std::string url;
+    std::string file;  // the token lives here (created on the first run)
+    std::string token;
+
+    // reads the token, or makes an account and saves its token; renew: the coordinator forgot the old one
+    // (restarted with the in-memory store). false: the coordinator has no accounts
+    bool load_or_create(bool renew = false) {
+        if (!renew && token.empty() && !file.empty()) {
+            std::ifstream f(u8_path(file));
+            std::getline(f, token);
+            while (!token.empty() && (token.back() == '\r' || token.back() == '\n' || token.back() == ' ')) {
+                token.pop_back();
+            }
+        }
+        if (!token.empty() && !renew) {
+            return true;
+        }
+        const http_reply r = coord_post(url, "/v1/accounts", json::object());
+        if (r.status == 404) {
+            token.clear();
+            return false;
+        }
+        if (r.status != 200 || r.body.value("token", "").empty()) {
+            throw std::runtime_error("cannot create an account at the coordinator: " + r.error());
+        }
+        token = r.body.value("token", "");
+        if (!file.empty()) {
+            std::ofstream f(u8_path(file), std::ios::trunc);
+            f << token << "\n";
+        }
+        printf("agent-node: new account %s at the coordinator, %lld points, the token is in %s\n",
+            r.body.value("account_id", "").c_str(), (long long) r.body.value("balance", 0), file.empty() ? "(memory)" : file.c_str());
+        fflush(stdout);
+        return true;
+    }
+
+    httplib::Headers headers() const {
+        if (token.empty()) {
+            return {};
+        }
+        return { { "Authorization", "Bearer " + token } };
+    }
+
+    // POST with the account; once more with a new account if the coordinator does not know this one
+    http_reply post(const std::string & path, const json & body) {
+        http_reply r = coord_post(url, path, body, headers());
+        if (r.status == 401 && r.error().find("account") != std::string::npos && load_or_create(true)) {
+            r = coord_post(url, path, body, headers());
+        }
+        return r;
+    }
+};
+
+static coord_account account_from(const cli_args & a) {
+    coord_account acc;
+    acc.url  = a.get("--coordinator", "", "");
+    acc.file = a.get("--account", "", "agent-account.txt");
+    if (a.get("--account", "", "") != "off") {
+        acc.load_or_create();
+    }
+    return acc;
+}
+
+// a chain from the coordinator for one session: nodes and spares with their pins and tokens
+struct coord_chain {
+    std::vector<node_ref> nodes, spares;
+    uint64_t              session = 0;
+    std::string           session_hex;
+    int                   no_spare = 0;
+    double                ms = 0;
+};
+
+static coord_chain request_chain(coord_account & acc, const std::string & model_key, int spares, int ttl_s, const std::string & city) {
+    json req = { { "model", model_key }, { "spares", spares }, { "ttl_s", ttl_s } };
+    if (!city.empty()) {
+        req["city"] = city;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const http_reply r = acc.post("/v1/chains", req);
+    if (r.status == 402) {
+        throw std::runtime_error("not enough points for a request: " + r.error());
+    }
+    if (r.status != 200) {
+        throw std::runtime_error("the coordinator gave no chain: " + r.error());
+    }
+    auto refs_of = [](const json & arr) {
+        std::vector<node_ref> out;
+        for (const auto & n : arr) {
+            out.push_back({ n.at("addr").get<std::string>(), "", n.at("token").get<std::string>(), n.at("pin").get<std::string>() });
+        }
+        return out;
+    };
+    coord_chain c;
+    c.nodes       = refs_of(r.body.at("nodes"));
+    c.spares      = refs_of(r.body.at("spares"));
+    c.session_hex = r.body.at("session").get<std::string>();
+    c.session     = std::stoull(c.session_hex, nullptr, 16);
+    c.no_spare    = r.body.value("stages_without_spare", 0);
+    c.ms          = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return c;
+}
+
+// after the answer: the client tells the coordinator how many tokens there were and pays for them
+// returns the balance after the payment, -1 when the coordinator has no accounts
+static long long report_session(coord_account & acc, const std::string & session_hex, int32_t n_prompt, int32_t n_gen, long long * charged = nullptr) {
+    if (acc.token.empty()) {
+        return -1;
+    }
+    try {
+        const http_reply r = acc.post("/v1/sessions/" + session_hex + "/report", { { "prompt_tokens", n_prompt }, { "gen_tokens", n_gen } });
+        if (r.status != 200) {
+            AN_LOG("warning: the report of session %s was not accepted: %s\n", session_hex.c_str(), r.error().c_str());
+            return -1;
+        }
+        if (charged) {
+            *charged = r.body.value("charged", 0LL);
+        }
+        return r.body.value("balance", 0LL);
+    } catch (const std::exception & e) {
+        AN_LOG("warning: report of session %s: %s\n", session_hex.c_str(), e.what());
+        return -1;
+    }
+}
+
 static int cmd_node(const cli_args & a) {
     node_server srv;
     const bool assigned = a.has("--model-url");
@@ -1158,6 +1330,23 @@ static int cmd_node(const cli_args & a) {
             { "max_sessions", srv.max_sessions },
             { "city", a.get("--city", "", "") },
         };
+        if (a.has("--disk-gb")) {
+            link.reg["disk_gb"] = std::stod(a.get("--disk-gb", "", "0"));
+        }
+        // the owner of this node gets the points for its work
+        static coord_account acc;
+        acc = account_from(a);
+        if (!acc.token.empty()) {
+            link.reg["account_token"] = acc.token;
+        }
+        link.renew_account = [&link]() {
+            if (!acc.load_or_create(true)) {
+                return false;
+            }
+            link.reg["account_token"] = acc.token;
+            return true;
+        };
+        link.work = [&srv]() { return srv.work_json(); };
         link.sessions = [&srv]() {
             std::lock_guard<std::mutex> lock(srv.mtx);
             return (int) srv.sessions.size();
@@ -1183,14 +1372,6 @@ struct evaluator {
     virtual ~evaluator() = default;
     // runs n tokens from position pos0, returns the top-k of the last token, or of every token with out_all
     virtual std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) = 0;
-};
-
-// one node of the chain as the client knows it
-struct node_ref {
-    std::string addr;
-    std::string key;   // secret key of the node, to issue tokens itself (tests; normally the coordinator issues them)
-    std::string token; // access token issued by the coordinator for the session
-    std::string pin;   // expected certificate fingerprint ("" = not checked)
 };
 
 struct chain_opts {
@@ -1639,6 +1820,8 @@ struct gen_opts {
     std::string json;
     std::vector<llama_token> force; // follow these tokens instead of the greedy choice (from a reference dump)
     payload     hidden = payload::q8;
+    // every generated token goes here instead of stdout; false stops the generation (the reader went away)
+    std::function<bool(llama_token)> on_token;
 };
 
 static gen_opts gen_opts_from(const cli_args & a) {
@@ -1738,8 +1921,14 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
             }
             fprintf(dump, "\n");
         }
-        printf("%s", common_token_to_piece(vocab, tok, false).c_str());
-        fflush(stdout);
+        if (g.on_token) {
+            if (!g.on_token(tok)) {
+                break;
+            }
+        } else {
+            printf("%s", common_token_to_piece(vocab, tok, false).c_str());
+            fflush(stdout);
+        }
 
         if (i + 1 == g.n_gen || (!g.ignore_eos && llama_vocab_is_eog(vocab, tok))) {
             break;
@@ -1748,7 +1937,9 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
         res.n_gen_eval++;
     }
     res.gen_ms = now_ms() - t0;
-    printf("\n");
+    if (!g.on_token) {
+        printf("\n");
+    }
     if (dump) {
         fclose(dump);
     }
@@ -1782,6 +1973,11 @@ struct draft_model {
         if (!ctx) {
             throw std::runtime_error("failed to create the context of the draft model");
         }
+    }
+
+    // a new text: forget the previous one (the local API serves many requests with one draft model)
+    void reset() {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
     }
 
     // decodes n tokens from pos0, returns the greedy next token
@@ -1839,6 +2035,7 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
 
     gen_result res;
     res.n_prompt = (int32_t) prompt.size();
+    dm.reset();
 
     double t0 = now_ms();
     std::vector<top_entry> top;
@@ -1871,9 +2068,15 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
             }
             fprintf(dump, "\n");
         }
-        printf("%s", common_token_to_piece(vocab, tok, false).c_str());
-        fflush(stdout);
         n_out++;
+        if (g.on_token) {
+            if (!g.on_token(tok)) {
+                return true;
+            }
+        } else {
+            printf("%s", common_token_to_piece(vocab, tok, false).c_str());
+            fflush(stdout);
+        }
         return n_out == g.n_gen || (!g.ignore_eos && llama_vocab_is_eog(vocab, tok));
     };
 
@@ -1942,7 +2145,9 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     }
     res.gen_ms     = now_ms() - t0;
     res.n_gen_eval = (int32_t) res.tokens.size() - 1;
-    printf("\n");
+    if (!g.on_token) {
+        printf("\n");
+    }
     if (dump) {
         fclose(dump);
     }
@@ -1989,34 +2194,21 @@ static int cmd_client(const cli_args & a) {
     // a chain from the coordinator: nodes and spares with their pins and tokens for one session
     std::vector<node_ref> coord_nodes, coord_spares;
     uint64_t coord_session = 0;
+    coord_account acc;
+    std::string session_hex;
     if (a.has("--coordinator")) {
-        json req = { { "model", model_key(mo.path) },
-                     { "spares", a.get_int("--spares", "", 1) }, { "ttl_s", a.get_int("--token-ttl", "", 3600) } };
-        if (a.has("--city")) {
-            req["city"] = a.get("--city", "", "");
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        const http_reply r = coord_post(a.get("--coordinator", "", ""), "/v1/chains", req);
-        if (r.status != 200) {
-            throw std::runtime_error("the coordinator gave no chain: " + r.error());
-        }
-        auto refs_of = [](const json & arr) {
-            std::vector<node_ref> out;
-            for (const auto & n : arr) {
-                out.push_back({ n.at("addr").get<std::string>(), "", n.at("token").get<std::string>(), n.at("pin").get<std::string>() });
-            }
-            return out;
-        };
-        coord_nodes   = refs_of(r.body.at("nodes"));
-        coord_spares  = refs_of(r.body.at("spares"));
-        coord_session = std::stoull(r.body.at("session").get<std::string>(), nullptr, 16);
+        acc = account_from(a);
+        const coord_chain c = request_chain(acc, model_key(mo.path), a.get_int("--spares", "", 1), a.get_int("--token-ttl", "", 3600),
+            a.get("--city", "", ""));
+        coord_nodes   = c.nodes;
+        coord_spares  = c.spares;
+        coord_session = c.session;
+        session_hex   = c.session_hex;
         for (const auto & n : coord_nodes) {
             addrs.push_back(n.addr);
         }
         AN_LOG("coordinator: chain of %zu nodes and %zu spares for session %s in %.0f ms (%d layer ranges without a spare)\n",
-            coord_nodes.size(), coord_spares.size(), r.body.at("session").get<std::string>().c_str(),
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
-            r.body.value("stages_without_spare", 0));
+            coord_nodes.size(), coord_spares.size(), session_hex.c_str(), c.ms, c.no_spare);
     }
 
     const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
@@ -2111,6 +2303,13 @@ static int cmd_client(const cli_args & a) {
     const std::vector<stats_msg> st1 = chain.stats();
 
     print_speed(r);
+    if (!session_hex.empty()) {
+        long long charged = 0;
+        const long long bal = report_session(acc, session_hex, r.n_prompt, (int32_t) r.tokens.size(), &charged);
+        if (bal >= 0) {
+            AN_LOG("points: %lld for this answer, %lld left\n", charged, bal);
+        }
+    }
     if (chain.n_recoveries > 0) {
         AN_LOG("recoveries: %d, the longest pause %.0f ms (counters of the nodes restarted)\n", chain.n_recoveries, chain.recover_max_ms);
         st0.assign(st1.size(), stats_msg());
