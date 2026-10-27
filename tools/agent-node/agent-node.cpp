@@ -107,7 +107,7 @@ struct cli_args {
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--every", "--rounds",
-            "--listen-host", "--listen-port", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--listen-host", "--listen-port", "--relay", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -1222,6 +1222,61 @@ static long long report_session(coord_account & acc, const std::string & session
     }
 }
 
+// a node behind NAT: it keeps a connection to the relay of the network, and the relay hands it the connections
+// of the others (relay://relay/<fingerprint>); TLS between the nodes goes through the relay unchanged
+static void relay_listen(node_server & srv, const std::string & coord, const std::string & fingerprint, json ticket) {
+    int backoff = 1;
+    while (true) {
+        try {
+            if (ticket.value("expires", 0LL) - (long long) std::time(nullptr) < 3600) {
+                const http_reply r = coord_post(coord, "/v1/relay/ticket", { { "tls_fingerprint", fingerprint } });
+                if (r.status != 200) {
+                    throw std::runtime_error("relay ticket: " + r.error());
+                }
+                ticket = r.body;
+            }
+            const std::string relay = ticket.value("relay", "");
+            tcp_conn_ptr ctl = tcp_connect_direct(relay, 10000);
+            const std::string req = "LISTEN " + ticket.value("id", "") + " " + std::to_string(ticket.value("expires", 0LL)) + " " +
+                                    ticket.value("ticket", "") + "\n";
+            if (!ctl->send_all(req.data(), req.size())) {
+                throw std::runtime_error("the relay closed the connection");
+            }
+            const std::string ok = relay_read_line(*ctl);
+            if (ok != "OK") {
+                throw std::runtime_error("relay: " + ok);
+            }
+            printf("agent-node: listening on the relay %s\n", relay.c_str());
+            fflush(stdout);
+            backoff = 1;
+            ctl->recv_timeout_ms = 70000; // the relay pings every 20 s
+            while (true) {
+                const std::string line = relay_read_line(*ctl);
+                if (line.rfind("INCOMING ", 0) != 0) {
+                    continue; // PING
+                }
+                const std::string cid = line.substr(9);
+                std::thread([&srv, relay, cid]() {
+                    try {
+                        tcp_conn_ptr c = tcp_connect_direct(relay, 10000);
+                        const std::string acc = "ACCEPT " + cid + "\n";
+                        if (!c->send_all(acc.data(), acc.size()) || relay_read_line(*c) != "OK") {
+                            return;
+                        }
+                        srv.serve(c); // TLS handshake and frames as for a direct connection
+                    } catch (const std::exception & e) {
+                        AN_LOG("warning: relay connection: %s\n", e.what());
+                    }
+                }).detach();
+            }
+        } catch (const std::exception & e) {
+            AN_LOG("warning: relay: %s (retrying in %d s)\n", e.what(), backoff);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(backoff));
+        backoff = std::min(backoff * 2, 30);
+    }
+}
+
 static int cmd_node(const cli_args & a) {
     node_server srv;
     const bool assigned = a.has("--model-url");
@@ -1377,7 +1432,22 @@ static int cmd_node(const cli_args & a) {
         }
         const int32_t n_layer = llama_model_n_layer(srv.model.get());
         // an empty host: the coordinator takes the address the registration came from
-        const std::string pub = a.get("--public-addr", "", (host == "0.0.0.0" || host == "::" ? "" : host) + ":" + std::to_string(port));
+        std::string pub = a.get("--public-addr", "", (host == "0.0.0.0" || host == "::" ? "" : host) + ":" + std::to_string(port));
+        // behind NAT: the relay of the network (--relay auto: when no --public-addr is given; only: always)
+        const std::string relay_mode = a.get("--relay", "", "off");
+        if (relay_mode != "off") {
+            const http_reply r = coord_post(a.get("--coordinator", "", ""), "/v1/relay/ticket", { { "tls_fingerprint", fingerprint } });
+            if (r.status == 200) {
+                if (relay_mode == "only" || !a.has("--public-addr")) {
+                    pub = r.body.value("addr", pub);
+                }
+                std::thread(relay_listen, std::ref(srv), a.get("--coordinator", "", ""), fingerprint, r.body).detach();
+                // the relay link must be up before the coordinator checks the node through it
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            } else {
+                AN_LOG("warning: no relay in this network (%s): the node must be reachable at %s\n", r.error().c_str(), pub.c_str());
+            }
+        }
         link.url  = a.get("--coordinator", "", "");
         link.key  = srv.key;
         link.reg  = json{
@@ -3465,6 +3535,7 @@ static void usage() {
         "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
+        "                  [--relay off|auto|only]  behind NAT: reachable through the relay of the network\n"
         "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
         "                  instead of -m and --layers: the coordinator assigns the layers, the node downloads only them\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"

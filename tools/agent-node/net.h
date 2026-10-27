@@ -363,7 +363,51 @@ class tcp_conn {
 using tcp_conn_ptr = std::shared_ptr<tcp_conn>;
 
 // connects within timeout_ms
+// one line of the relay handshake, read byte by byte: after it the stream belongs to TLS
+inline std::string relay_read_line(tcp_conn & c) {
+    std::string line;
+    char ch = 0;
+    while (line.size() < 512) {
+        if (!c.recv_all(&ch, 1)) {
+            throw std::runtime_error("the relay closed the connection");
+        }
+        if (ch == '\n') {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            return line;
+        }
+        line += ch;
+    }
+    throw std::runtime_error("the relay sent a too long line");
+}
+
+inline tcp_conn_ptr tcp_connect_direct(const std::string & addr, int timeout_ms);
+
+// addr: host:port, or relay://relayhost:port/<id> for a node behind NAT (the relay joins the two connections,
+// TLS between the nodes goes through it unchanged)
 inline tcp_conn_ptr tcp_connect(const std::string & addr, int timeout_ms = 5000) {
+    const std::string pre = "relay://";
+    if (addr.rfind(pre, 0) == 0) {
+        const size_t slash = addr.rfind('/');
+        if (slash == std::string::npos || slash < pre.size()) {
+            throw std::runtime_error("bad relay address " + addr);
+        }
+        tcp_conn_ptr c = tcp_connect_direct(addr.substr(pre.size(), slash - pre.size()), timeout_ms);
+        const std::string req = "CONNECT " + addr.substr(slash + 1) + "\n";
+        if (!c->send_all(req.data(), req.size())) {
+            throw std::runtime_error("cannot reach the relay of " + addr);
+        }
+        const std::string line = relay_read_line(*c);
+        if (line != "OK") {
+            throw std::runtime_error("relay: " + (line.rfind("ERR ", 0) == 0 ? line.substr(4) : line) + " (" + addr + ")");
+        }
+        return c;
+    }
+    return tcp_connect_direct(addr, timeout_ms);
+}
+
+inline tcp_conn_ptr tcp_connect_direct(const std::string & addr, int timeout_ms) {
     std::string host;
     int port = 0;
     split_addr(addr, host, port);
