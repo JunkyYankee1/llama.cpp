@@ -10,6 +10,7 @@
 
 #include "coordinator.h"
 #include "gpu_clocks.h"
+#include "p2p.h"
 #include "protocol.h"
 #include "secure.h"
 #include "slice.h"
@@ -106,7 +107,7 @@ struct cli_args {
             "--keys", "--pins", "--spare", "--spare-keys", "--spare-tokens", "--spare-pins", "--tls", "--timeout", "--session",
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
-            "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--every", "--rounds",
+            "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
@@ -394,7 +395,18 @@ struct model_part {
 // node: serves one part of the model to clients and to the previous node
 //
 
+// sessions that ended in this process: the node tells the coordinator at once (coord_link::ended)
+static std::atomic<uint64_t> g_sessions_ended{0};
+
 struct session {
+    ~session() {
+        g_sessions_ended++;
+        // the connection to the next node belongs to the session: closing it ends the thread that reads it and,
+        // on the next node, the side of the session that came from here
+        if (next) {
+            next->close();
+        }
+    }
     uint64_t                    id = 0;
     std::unique_ptr<model_part> part;
     uint32_t                    n_top = 8;
@@ -1261,6 +1273,11 @@ static void relay_listen(node_server & srv, const std::string & coord, const std
                 ticket = r.body;
             }
             const std::string relay = ticket.value("relay", "");
+            if (p2p_dial) {
+                // the same ticket registers the node at the rendezvous server (UDP, the same port)
+                p2p_endpoint::get().listen(relay, ticket.value("id", ""), ticket.value("expires", 0LL), ticket.value("ticket", ""),
+                                           [&srv](tcp_conn_ptr c) { srv.serve(c); });
+            }
             tcp_conn_ptr ctl = tcp_connect_direct(relay, 10000);
             const std::string req = "LISTEN " + ticket.value("id", "") + " " + std::to_string(ticket.value("expires", 0LL)) + " " +
                                     ticket.value("ticket", "") + "\n";
@@ -1509,6 +1526,7 @@ static int cmd_node(const cli_args & a) {
             return true;
         };
         link.work = [&srv]() { return srv.work_json(); };
+        link.ended    = []() { return g_sessions_ended.load(); };
         link.sessions = [&srv]() {
             std::lock_guard<std::mutex> lock(srv.mtx);
             return (int) srv.sessions.size();
@@ -3490,6 +3508,98 @@ static int cmd_slice(const cli_args & a) {
 
 // devices: the compute devices ggml sees, as JSON, so that scripts can pick the right one
 // (for example the discrete card and not the integrated one when both are Vulkan devices)
+// a check of the direct transport without a model (CI, a quick look at a network):
+//   agent-node p2p-echo serve  --rendezvous HOST:PORT --secret S   echoes every frame back
+//   agent-node p2p-echo client --rendezvous HOST:PORT --secret S [--bytes N]
+// the secret is the RELAY_SECRET of the rendezvous server (the coordinator hands out tickets made with it)
+static int cmd_p2p_echo(const cli_args & a, const std::string & mode) {
+#ifndef AGENT_HAVE_TLS
+    require_tls("p2p-echo");
+    return 1;
+#else
+    const std::string rv = a.get("--rendezvous", "", "127.0.0.1:4001");
+    const std::string secret = a.get("--secret", "", "");
+    const std::string id = std::string(64, 'e');
+    auto & ep = p2p_endpoint::get();
+    if (!p2p_dial) {
+        throw std::runtime_error("p2p is off");
+    }
+    auto read_chunk = [](tcp_conn & c, std::vector<uint8_t> & buf) {
+        uint32_t n = 0;
+        if (!c.recv_all(&n, 4) || n > (1u << 20)) {
+            return false;
+        }
+        buf.resize(n);
+        return c.recv_all(buf.data(), n);
+    };
+    auto send_chunk = [](tcp_conn & c, const uint8_t * p, uint32_t n) {
+        std::lock_guard<std::mutex> lock(c.send_mutex);
+        return c.send_all(&n, 4) && c.send_all(p, n);
+    };
+    if (mode == "serve") {
+        const long long exp = (long long) unix_now() + 3600;
+        const std::string ticket = hmac_hex(std::vector<uint8_t>(secret.begin(), secret.end()),
+                                            "agent-relay/1|" + id + "|" + std::to_string(exp));
+        ep.listen(rv, id, exp, ticket, [&](tcp_conn_ptr c) {
+            std::vector<uint8_t> buf;
+            while (read_chunk(*c, buf) && send_chunk(*c, buf.data(), (uint32_t) buf.size())) {
+            }
+        });
+        printf("p2p-echo: serving as %s through %s\n", id.substr(0, 16).c_str(), rv.c_str());
+        fflush(stdout);
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+    const size_t total = (size_t) std::stoull(a.get("--bytes", "", "8000000"));
+    std::string err;
+    const double t0 = now_ms();
+    tcp_conn_ptr c = ep.connect(rv, id, err);
+    if (!c) {
+        printf("p2p-echo: no direct connection: %s\n", err.c_str());
+        return 1;
+    }
+    printf("p2p-echo: connected in %.0f ms via %s\n", now_ms() - t0, ep.last_path.c_str());
+    std::vector<uint8_t> small(64), back;
+    const double r0 = now_ms();
+    for (int i = 0; i < 200; i++) {
+        small[0] = (uint8_t) i;
+        if (!send_chunk(*c, small.data(), 64) || !read_chunk(*c, back) || back != small) {
+            printf("p2p-echo: round trip %d failed\n", i);
+            return 1;
+        }
+    }
+    printf("p2p-echo: round trip of 64 bytes %.2f ms\n", (now_ms() - r0) / 200);
+    std::vector<uint8_t> data(total);
+    std::mt19937 rng(7);
+    for (auto & b : data) {
+        b = (uint8_t) rng();
+    }
+    const double b0 = now_ms();
+    const size_t chunk = 60000;
+    std::thread w([&]() {
+        for (size_t off = 0; off < total; off += chunk) {
+            if (!send_chunk(*c, data.data() + off, (uint32_t) std::min(chunk, total - off))) {
+                return;
+            }
+        }
+    });
+    c->recv_timeout_ms = 30000;
+    size_t got = 0;
+    bool ok = true;
+    while (ok && got < total) {
+        ok = read_chunk(*c, back) && memcmp(back.data(), data.data() + got, back.size()) == 0;
+        got += back.size();
+    }
+    w.join();
+    const double s = (now_ms() - b0) / 1000;
+    printf("p2p-echo: %zu bytes there and back %s in %.2f s (%.1f Mbit/s each way)\n", total, ok ? "intact" : "BROKEN", s,
+        total * 8 / s / 1e6);
+    c->close();
+    return ok ? 0 : 1;
+#endif
+}
+
 static int cmd_devices() {
     json out = json::array();
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -3565,6 +3675,7 @@ static void usage() {
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "                  [--relay off|auto|only]  behind NAT: reachable through the relay of the network\n"
+        "                  [--p2p on|off]  behind NAT: direct UDP connections through the rendezvous server first (on)\n"
         "      node|verify [--cpu-moe [--ram-gb N]]  the experts of an MoE model in RAM, the rest on the GPU\n"
         "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
         "                  instead of -m and --layers: the coordinator assigns the layers, the node downloads only them\n"
@@ -3643,7 +3754,14 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         llama_backend_init();
         net_init();
+        // direct UDP connections to nodes behind NAT, the TCP relay stays the fallback (--p2p off: relay only)
+        if ((cmd == "node" || cmd == "client" || cmd == "serve" || cmd == "verify" || cmd == "p2p-echo") && a.get("--p2p", "", "on") != "off") {
+            p2p_init();
+        }
 
+        if (cmd == "p2p-echo") {
+            return cmd_p2p_echo(a, argc > 2 ? argv[2] : "");
+        }
         if (cmd == "devices") {
             return cmd_devices();
         }

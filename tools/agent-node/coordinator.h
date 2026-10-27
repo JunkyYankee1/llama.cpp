@@ -81,6 +81,7 @@ struct coord_link {
     json                     reg;      // the registration body
     std::vector<uint8_t>     key;
     std::function<int()>     sessions; // open sessions now
+    std::function<uint64_t()> ended;   // sessions ended so far (a counter): a change sends a heartbeat at once
     std::function<json()>    work;     // tokens per session that went through the node (for the points of the owner)
     // the coordinator does not know the account of the registration (restarted with the in-memory store):
     // make a new one and put its token into reg; false: no account
@@ -92,6 +93,8 @@ struct coord_link {
         int interval_s = 10;
         int backoff_s  = 1;
         bool warned    = false;
+        int last_beat  = -1; // sessions in the last heartbeat
+        uint64_t ended_at_beat = 0;
         while (!stop) {
             int wait_s = interval_s;
             try {
@@ -106,6 +109,8 @@ struct coord_link {
                     id         = r.body.value("id", "");
                     interval_s = std::max(1, r.body.value("heartbeat_s", 10));
                     wait_s     = interval_s;
+                    last_beat     = 0; // a fresh registration counts no sessions
+                    ended_at_beat = ended ? ended() : 0;
                     backoff_s  = 1;
                     warned     = false;
                     // the scripts may wait for this line
@@ -117,7 +122,9 @@ struct coord_link {
 #else
                     const httplib::Headers h;
 #endif
-                    json beat = { { "sessions", sessions() } };
+                    ended_at_beat = ended ? ended() : 0;
+                    last_beat     = sessions();
+                    json beat = { { "sessions", last_beat } };
                     if (work) {
                         beat["work"] = work();
                     }
@@ -142,6 +149,11 @@ struct coord_link {
             }
             for (int i = 0; i < wait_s * 10 && !stop; i++) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                // a session ended: tell the coordinator now (it counts every chain it gives out as a new session until
+                // the next heartbeat, so an agent asking several times in a row would find the node full)
+                if (i >= 2 && !id.empty() && last_beat >= 0 && ended && ended() != ended_at_beat) {
+                    break;
+                }
             }
         }
     }

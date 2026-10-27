@@ -51,6 +51,7 @@ typedef int agent_socket_t;
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -384,6 +385,11 @@ inline std::string relay_read_line(tcp_conn & c) {
 
 inline tcp_conn_ptr tcp_connect_direct(const std::string & addr, int timeout_ms);
 
+// direct connection through UDP hole punching (p2p.h, set by p2p_init): server is the rendezvous server (the relay
+// host:port), id the node; returns nullptr with the reason in err when there is no direct path
+using p2p_dial_fn = tcp_conn_ptr (*)(const std::string & server, const std::string & id, std::string & err);
+inline p2p_dial_fn p2p_dial = nullptr;
+
 // addr: host:port, or relay://relayhost:port/<id> for a node behind NAT (the relay joins the two connections,
 // TLS between the nodes goes through it unchanged)
 inline tcp_conn_ptr tcp_connect(const std::string & addr, int timeout_ms = 5000) {
@@ -393,7 +399,18 @@ inline tcp_conn_ptr tcp_connect(const std::string & addr, int timeout_ms = 5000)
         if (slash == std::string::npos || slash < pre.size()) {
             throw std::runtime_error("bad relay address " + addr);
         }
-        tcp_conn_ptr c = tcp_connect_direct(addr.substr(pre.size(), slash - pre.size()), timeout_ms);
+        const std::string relay = addr.substr(pre.size(), slash - pre.size());
+        if (p2p_dial) {
+            std::string err;
+            if (tcp_conn_ptr c = p2p_dial(relay, addr.substr(slash + 1), err)) {
+                return c;
+            }
+            // remembered for a while: the next connections to this node go to the relay at once, without this line
+            if (err.find("recently") == std::string::npos) {
+                fprintf(stderr, "p2p: %s: %s, using the relay\n", addr.c_str(), err.c_str());
+            }
+        }
+        tcp_conn_ptr c = tcp_connect_direct(relay, timeout_ms);
         const std::string req = "CONNECT " + addr.substr(slash + 1) + "\n";
         if (!c->send_all(req.data(), req.size())) {
             throw std::runtime_error("cannot reach the relay of " + addr);
