@@ -403,6 +403,8 @@ inline tcp_conn_ptr tcp_connect(const std::string & addr, int timeout_ms = 5000)
         if (p2p_dial) {
             std::string err;
             if (tcp_conn_ptr c = p2p_dial(relay, addr.substr(slash + 1), err)) {
+                // the scripts count these lines: how many links of a chain went around the relay
+                fprintf(stderr, "p2p: %s: direct\n", addr.c_str());
                 return c;
             }
             // remembered for a while: the next connections to this node go to the relay at once, without this line
