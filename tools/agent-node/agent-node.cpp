@@ -78,7 +78,7 @@ struct cli_args {
 
     static bool is_flag(const std::string & name) {
         return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose" ||
-               name == "--vocab-only" || name == "--cpu-moe";
+               name == "--vocab-only" || name == "--cpu-moe" || name == "--check";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -108,7 +108,7 @@ struct cli_args {
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
-            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs",
+            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -3461,7 +3461,8 @@ static std::string model_key(const std::string & path) {
 // layers of the node (--layers, as the node holds them) for 1, 2, 4, 8 sequences at once, each after -c tokens
 // of context. If a step of 4 sequences costs about as much as a step of one, nodes should batch the sessions of
 // several users (docs/Параллельные сессии.md). The inputs are random: the tokens of different users route to
-// different experts of an MoE model, as random hidden states do.
+// different experts of an MoE model, as random hidden states do. --check also decodes each sequence alone and
+// compares the outputs: a batch must give what the sequences give one by one.
 static int cmd_bench_batch(const cli_args & a) {
     const model_opts mo = model_opts_from(a);
     std::vector<int> seqs;
@@ -3480,6 +3481,7 @@ static int cmd_bench_batch(const cli_args & a) {
     const int n_steps   = a.get_int("-n", "--n-predict", 32);
     const int n_threads = a.get_int("-t", "--threads", common_cpu_get_num_math());
     const int max_seq   = *std::max_element(seqs.begin(), seqs.end());
+    const bool check    = a.has("--check");
 
     llama_model_ptr model = load_model(mo);
     const int  n_layer = llama_model_n_layer(model.get());
@@ -3507,20 +3509,21 @@ static int cmd_bench_batch(const cli_args & a) {
     }
 
     std::mt19937 rng(1);
-    std::uniform_int_distribution<llama_token> tok(0, n_vocab - 1);
     std::normal_distribution<float> val(0.0f, 1.0f);
     std::vector<float> embd((size_t) 512 * n_embd);
     for (float & x : embd) {
         x = val(rng);
     }
     common_batch batch(ctx.get());
-    // n entries: sequence seq0 + i at position pos0 (or sequence seq at positions pos0 + i)
-    auto add = [&](int i, llama_pos p, llama_seq_id s, bool out) {
+    // the input of user u at position p: the same whatever the batch, so that --check can decode it alone
+    // (into sequence s) and get the same output
+    auto add = [&](int u, llama_pos p, llama_seq_id s, bool out) {
+        const uint32_t h = (uint32_t) u * 2654435761u ^ (uint32_t) p * 40503u;
         if (is_first) {
-            batch.add(tok(rng), p, s, out);
+            batch.add((llama_token) (h % (uint32_t) n_vocab), p, s, out);
         } else {
             const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
-            batch.add_embd({ embd.data() + (size_t) (i % 512) * n_embd, 1, (size_t) n_embd }, pos, s, out);
+            batch.add_embd({ embd.data() + (size_t) (h % 512) * n_embd, 1, (size_t) n_embd }, pos, s, out);
         }
     };
     auto process = [&]() {
@@ -3530,22 +3533,36 @@ static int cmd_bench_batch(const cli_args & a) {
         llama_synchronize(ctx.get());
     };
 
+    // the history of users 0..n-1, user u into sequence u (or all into sequence seq when alone)
+    auto prefill = [&](int u0, int n, bool alone) {
+        for (int u = u0; u < u0 + n; u++) {
+            for (int p0 = 0; p0 < n_hist; p0 += 512) {
+                batch.clear();
+                const int m = std::min(512, n_hist - p0);
+                for (int i = 0; i < m; i++) {
+                    add(u, p0 + i, alone ? 0 : u, i + 1 == m);
+                }
+                process();
+            }
+        }
+    };
+    // the output of batch entry i: the hidden state, or the logits at the last layer
+    const int n_out = is_last ? n_vocab : n_embd;
+    auto output = [&](int i) {
+        const float * o = is_last ? llama_get_logits_ith(ctx.get(), i) : llama_get_embeddings_ith(ctx.get(), i);
+        if (o == nullptr) {
+            throw std::runtime_error("no output for batch entry " + std::to_string(i));
+        }
+        return std::vector<float>(o, o + n_out);
+    };
+
     AN_LOG("bench-batch: layers [%d, %d) of %d, %d tokens of context per sequence, %d steps\n", first, last, n_layer, n_hist, n_steps);
     json rows = json::array();
     double ms1 = 0;
     printf("%6s %12s %14s %10s\n", "seqs", "ms/step", "tokens/s", "vs 1");
     for (int n : seqs) {
         llama_memory_clear(llama_get_memory(ctx.get()), true);
-        for (int s = 0; s < n; s++) {
-            for (int p0 = 0; p0 < n_hist; p0 += 512) {
-                batch.clear();
-                const int m = std::min(512, n_hist - p0);
-                for (int i = 0; i < m; i++) {
-                    add(i, p0 + i, s, i + 1 == m);
-                }
-                process();
-            }
-        }
+        prefill(0, n, false);
         double total = 0;
         for (int t = -2; t < n_steps; t++) { // two steps to warm up
             batch.clear();
@@ -3562,8 +3579,41 @@ static int cmd_bench_batch(const cli_args & a) {
         if (n == seqs[0]) {
             ms1 = ms / n; // per sequence of the first size, normally 1
         }
-        printf("%6d %12.2f %14.1f %9.2fx\n", n, ms, n * 1000.0 / ms, n * ms1 / ms);
-        rows.push_back({ { "seqs", n }, { "ms_per_step", ms }, { "tok_s", n * 1000.0 / ms } });
+        json row = { { "seqs", n }, { "ms_per_step", ms }, { "tok_s", n * 1000.0 / ms } };
+        std::string verdict;
+        if (check && n > 1) {
+            // the outputs of the last measured step, then each user alone with the same history and input
+            std::vector<std::vector<float>> got;
+            for (int u = 0; u < n; u++) {
+                got.push_back(output(u));
+            }
+            double max_diff = 0, max_ref = 0;
+            int top_same = 0;
+            for (int u = 0; u < n; u++) {
+                llama_memory_clear(llama_get_memory(ctx.get()), true);
+                prefill(u, 1, true);
+                for (int t = -2; t < n_steps; t++) {
+                    batch.clear();
+                    add(u, n_hist + 2 + t, 0, true);
+                    process();
+                }
+                const std::vector<float> ref = output(0);
+                for (int k = 0; k < n_out; k++) {
+                    max_diff = std::max(max_diff, (double) std::fabs(got[u][k] - ref[k]));
+                    max_ref  = std::max(max_ref, (double) std::fabs(ref[k]));
+                }
+                top_same += std::max_element(got[u].begin(), got[u].end()) - got[u].begin() ==
+                            std::max_element(ref.begin(), ref.end()) - ref.begin();
+            }
+            row["max_diff"] = max_diff;
+            row["max_ref"]  = max_ref;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  check: max |diff| %.4g of max |value| %.4g%s", max_diff, max_ref,
+                is_last ? (", top-1 same " + std::to_string(top_same) + "/" + std::to_string(n)).c_str() : "");
+            verdict = buf;
+        }
+        printf("%6d %12.2f %14.1f %9.2fx%s\n", n, ms, n * 1000.0 / ms, n * ms1 / ms, verdict.c_str());
+        rows.push_back(row);
     }
     const std::string out = a.get("--json", "", "");
     if (!out.empty()) {
@@ -3779,7 +3829,7 @@ static void usage() {
         "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
-        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe] [--seqs 1,2,4,8] [-c 512] [-n 32] [--json F]\n"
+        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe] [--seqs 1,2,4,8] [-c 512] [-n 32] [--check] [--json F]\n"
         "                       one decode step of the layers for several sequences at once: what batching sessions gives\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
         "                       only the weights of the range (downloaded by HTTP ranges), with the metadata of the model\n"
