@@ -108,7 +108,7 @@ struct cli_args {
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
-            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror",
+            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -3457,6 +3457,124 @@ static std::string model_key(const std::string & path) {
     return model_key_of({ g.get() });
 }
 
+// bench-batch: what a batch of several sessions costs on this device against one session. One decode step of the
+// layers of the node (--layers, as the node holds them) for 1, 2, 4, 8 sequences at once, each after -c tokens
+// of context. If a step of 4 sequences costs about as much as a step of one, nodes should batch the sessions of
+// several users (docs/Параллельные сессии.md). The inputs are random: the tokens of different users route to
+// different experts of an MoE model, as random hidden states do.
+static int cmd_bench_batch(const cli_args & a) {
+    const model_opts mo = model_opts_from(a);
+    std::vector<int> seqs;
+    {
+        std::stringstream ss(a.get("--seqs", "", "1,2,4,8"));
+        for (std::string x; std::getline(ss, x, ',');) {
+            if (!x.empty()) {
+                seqs.push_back(std::max(1, std::stoi(x)));
+            }
+        }
+    }
+    if (seqs.empty()) {
+        throw std::runtime_error("--seqs must list the batch sizes, e.g. 1,2,4,8");
+    }
+    const int n_hist    = a.get_int("-c", "--ctx-size", 512);  // context of each sequence before the measured steps
+    const int n_steps   = a.get_int("-n", "--n-predict", 32);
+    const int n_threads = a.get_int("-t", "--threads", common_cpu_get_num_math());
+    const int max_seq   = *std::max_element(seqs.begin(), seqs.end());
+
+    llama_model_ptr model = load_model(mo);
+    const int  n_layer = llama_model_n_layer(model.get());
+    const int  n_embd  = llama_model_n_embd(model.get());
+    const int  n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const int  first   = std::clamp(mo.layer_start, 0, n_layer);
+    const int  last    = mo.layer_end <= 0 ? n_layer : std::min(mo.layer_end, n_layer);
+    const bool is_first = first == 0, is_last = last == n_layer;
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = (uint32_t) (max_seq * (n_hist + n_steps + 8));
+    cp.n_batch         = 512;
+    cp.n_ubatch        = 512;
+    cp.n_seq_max       = (uint32_t) max_seq;
+    cp.n_threads       = n_threads;
+    cp.n_threads_batch = n_threads;
+    cp.no_perf         = true;
+    if (!is_last) {
+        cp.embeddings   = true;
+        cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    if (!ctx) {
+        throw std::runtime_error("failed to create the context");
+    }
+
+    std::mt19937 rng(1);
+    std::uniform_int_distribution<llama_token> tok(0, n_vocab - 1);
+    std::normal_distribution<float> val(0.0f, 1.0f);
+    std::vector<float> embd((size_t) 512 * n_embd);
+    for (float & x : embd) {
+        x = val(rng);
+    }
+    common_batch batch(ctx.get());
+    // n entries: sequence seq0 + i at position pos0 (or sequence seq at positions pos0 + i)
+    auto add = [&](int i, llama_pos p, llama_seq_id s, bool out) {
+        if (is_first) {
+            batch.add(tok(rng), p, s, out);
+        } else {
+            const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
+            batch.add_embd({ embd.data() + (size_t) (i % 512) * n_embd, 1, (size_t) n_embd }, pos, s, out);
+        }
+    };
+    auto process = [&]() {
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("llama_process failed");
+        }
+        llama_synchronize(ctx.get());
+    };
+
+    AN_LOG("bench-batch: layers [%d, %d) of %d, %d tokens of context per sequence, %d steps\n", first, last, n_layer, n_hist, n_steps);
+    json rows = json::array();
+    double ms1 = 0;
+    printf("%6s %12s %14s %10s\n", "seqs", "ms/step", "tokens/s", "vs 1");
+    for (int n : seqs) {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        for (int s = 0; s < n; s++) {
+            for (int p0 = 0; p0 < n_hist; p0 += 512) {
+                batch.clear();
+                const int m = std::min(512, n_hist - p0);
+                for (int i = 0; i < m; i++) {
+                    add(i, p0 + i, s, i + 1 == m);
+                }
+                process();
+            }
+        }
+        double total = 0;
+        for (int t = -2; t < n_steps; t++) { // two steps to warm up
+            batch.clear();
+            for (int s = 0; s < n; s++) {
+                add(s, n_hist + 2 + t, s, true);
+            }
+            const double t0 = now_ms();
+            process();
+            if (t >= 0) {
+                total += now_ms() - t0;
+            }
+        }
+        const double ms = total / n_steps;
+        if (n == seqs[0]) {
+            ms1 = ms / n; // per sequence of the first size, normally 1
+        }
+        printf("%6d %12.2f %14.1f %9.2fx\n", n, ms, n * 1000.0 / ms, n * ms1 / ms);
+        rows.push_back({ { "seqs", n }, { "ms_per_step", ms }, { "tok_s", n * 1000.0 / ms } });
+    }
+    const std::string out = a.get("--json", "", "");
+    if (!out.empty()) {
+        std::ofstream(out) << json({ { "model", model_desc(model.get()) }, { "layer_start", first }, { "layer_end", last }, { "n_layer", n_layer },
+                                     { "ctx_per_seq", n_hist }, { "steps", n_steps }, { "cpu_moe", mo.cpu_moe }, { "rows", rows } })
+                                   .dump(1)
+                               << "\n";
+    }
+    return 0;
+}
+
 static int cmd_info(const cli_args & a) {
     const std::string path = a.get("-m", "--model", "");
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
@@ -3661,6 +3779,8 @@ static void usage() {
         "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
+        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe] [--seqs 1,2,4,8] [-c 512] [-n 32] [--json F]\n"
+        "                       one decode step of the layers for several sequences at once: what batching sessions gives\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
         "                       only the weights of the range (downloaded by HTTP ranges), with the metadata of the model\n"
         "  agent-node devices                                  the compute devices (JSON: name, type, memory)\n"
@@ -3779,6 +3899,9 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "verify") {
             return cmd_verify(a);
+        }
+        if (cmd == "bench-batch") {
+            return cmd_bench_batch(a);
         }
         usage();
         return 2;
