@@ -1842,8 +1842,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
-    // non-causal attention needs the whole sequence in one ubatch
-    const bool embd_all     = output_all || !cparams.causal_attn;
+    // pooled embeddings and non-causal attention need the whole sequence in one ubatch; per-token embeddings
+    // (no pooling: the hidden states of a range of layers) do not, and splitting them by sequence would decode
+    // a batch of several sequences one sequence at a time
+    const bool embd_all     = (output_all && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) || !cparams.causal_attn;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
