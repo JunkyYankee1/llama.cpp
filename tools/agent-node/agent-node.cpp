@@ -23,6 +23,7 @@
 #    undef OCSP_REQUEST
 #    undef OCSP_RESPONSE
 #endif
+#include "vram.h"
 
 #include "chat.h"
 #include "common.h"
@@ -614,6 +615,8 @@ struct node_server {
     std::deque<fwd_job *>     queue;
     std::vector<llama_seq_id> free_seqs, ended_seqs; // ended: the worker clears them first
     uint64_t                  ctx_used = 0;          // tokens of the context promised to open sessions
+    // since the start: forwards, and those that ran in a pass with other sessions
+    std::atomic<uint64_t>     n_forwards{ 0 }, n_shared{ 0 };
 
     void start_worker() {
         for (uint32_t i = part->n_seq; i-- > 0;) {
@@ -661,6 +664,10 @@ struct node_server {
                 busy_guard guard(*this);
                 std::vector<part_job *> jobs(pass.begin(), pass.end());
                 part->run_batch(jobs.data(), jobs.size());
+            }
+            n_forwards += pass.size();
+            if (pass.size() > 1) {
+                n_shared += pass.size();
             }
             {
                 std::lock_guard<std::mutex> lock(q_mtx);
@@ -1222,7 +1229,9 @@ static std::string slice_name(const std::string & url, int32_t first, int32_t la
 
 // asks the coordinator which layers to hold (by the free video memory and the disk space this node gives),
 // downloads that slice unless it is already here, and points mo at it
-static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const std::string & fingerprint) {
+// asks the coordinator for layers and downloads them if they are not here; returns the bytes of the slice in video memory.
+// vram_limit: no more video memory than this for the model (the last slice did not fit), 0: what is free
+static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, const std::string & fingerprint, uint64_t vram_limit = 0) {
     const std::string url    = a.get("--model-url", "", "");
     const std::string coord  = a.get("--coordinator", "", "");
     const std::string dir    = a.get("--models-dir", "", "models");
@@ -1251,6 +1260,10 @@ static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const st
         vram = free > reserve ? free - reserve : 0;
         AN_LOG("node: %s: %s free of %s, %s for the model\n", ggml_backend_dev_description(dev), fmt_gb(free).c_str(),
             fmt_gb(total).c_str(), fmt_gb(vram).c_str());
+    }
+    if (vram_limit > 0 && vram_limit < vram) {
+        vram = vram_limit;
+        AN_LOG("node: at most %s for the model: the last layers did not fit in the video memory\n", fmt_gb(vram).c_str());
     }
 
     // RAM for the experts of an MoE model (--cpu-moe): the free memory minus 4 GB for the system, or --ram-gb
@@ -1343,6 +1356,14 @@ static void prepare_assigned_slice(const cli_args & a, model_opts & mo, const st
     mo.path        = path;
     mo.layer_start = first;
     mo.layer_end   = last;
+
+    uint64_t bytes = ms.slice_bytes(first, last);
+    if (mo.cpu_moe && (int32_t) ms.expert_bytes.size() == ms.n_layer) {
+        for (int32_t l = first; l < last; l++) {
+            bytes -= ms.expert_bytes[l];
+        }
+    }
+    return bytes;
 }
 
 static std::string model_key(const std::string & path);
@@ -1639,29 +1660,51 @@ static int cmd_node(const cli_args & a) {
         if (fingerprint.empty() || srv.key.empty()) {
             throw std::runtime_error("--model-url needs --tls and --key: the coordinator only hands out protected nodes");
         }
-        prepare_assigned_slice(a, srv.mo, fingerprint);
     }
+    uint64_t slice_vram = assigned ? prepare_assigned_slice(a, srv.mo, fingerprint) : 0;
 
-    srv.model = load_model(srv.mo);
-    {
-        const int32_t n_layer = llama_model_n_layer(srv.model.get());
-        const int32_t first   = std::clamp(srv.mo.layer_start, 0, n_layer);
-        const int32_t last    = srv.mo.layer_end <= 0 ? n_layer : std::min(srv.mo.layer_end, n_layer);
-        AN_LOG("node: %s, layers [%d, %d) of %d, listening on %s:%d\n", model_desc(srv.model.get()).c_str(),
-            first, last, n_layer, host.c_str(), port);
-    }
-
-    // for the coordinator, which prefers fast nodes; before the ready line, so that a measurement does not meet clients
+    ggml_backend_dev_t gpu = srv.mo.device.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
+                                                   : ggml_backend_dev_by_name(srv.mo.device.c_str());
+    const uint64_t margin = (uint64_t) a.get_int("--vram-margin-mb", "", 256) << 20;
     double ms_per_layer = 0;
-    if (a.has("--coordinator")) {
-        ms_per_layer = measure_ms_per_layer(srv.model.get(), srv.mo, srv.n_threads);
-        AN_LOG("node: %.3f ms per layer per token\n", ms_per_layer);
-    }
+    for (int attempt = 0;; attempt++) {
+        srv.model = load_model(srv.mo);
+        {
+            const int32_t n_layer = llama_model_n_layer(srv.model.get());
+            const int32_t first   = std::clamp(srv.mo.layer_start, 0, n_layer);
+            const int32_t last    = srv.mo.layer_end <= 0 ? n_layer : std::min(srv.mo.layer_end, n_layer);
+            AN_LOG("node: %s, layers [%d, %d) of %d, listening on %s:%d\n", model_desc(srv.model.get()).c_str(),
+                first, last, n_layer, host.c_str(), port);
+        }
 
-    // one context for the sessions: --max-sessions of --seq-ctx tokens, rolling back up to --seq-rollback draft tokens
-    srv.part = make_node_part(srv.model.get(), srv.mo, srv.n_threads, (uint32_t) std::clamp(a.get_int("--max-sessions", "", 4), 1, 64),
-        (uint32_t) a.get_int("--seq-ctx", "", 16384), (uint32_t) std::clamp(a.get_int("--seq-rollback", "", 6), 0, 32),
-        (uint64_t) a.get_int("--vram-margin-mb", "", 256) << 20);
+        // for the coordinator, which prefers fast nodes; before the ready line, so that a measurement does not meet clients
+        if (a.has("--coordinator")) {
+            ms_per_layer = measure_ms_per_layer(srv.model.get(), srv.mo, srv.n_threads);
+            AN_LOG("node: %.3f ms per layer per token\n", ms_per_layer);
+        }
+
+        // one context for the sessions: --max-sessions of --seq-ctx tokens, rolling back up to --seq-rollback draft tokens
+        srv.part = make_node_part(srv.model.get(), srv.mo, srv.n_threads, (uint32_t) std::clamp(a.get_int("--max-sessions", "", 4), 1, 64),
+            (uint32_t) a.get_int("--seq-ctx", "", 16384), (uint32_t) std::clamp(a.get_int("--seq-rollback", "", 6), 0, 32), margin);
+
+        // the weights or the context went past the video memory into shared memory: the part would run several times slower.
+        // Layers from the coordinator: ask for fewer (the video memory of the slice minus what did not fit and the margin)
+        const vram_state v = vram_probe(gpu);
+        if (v.over() == 0) {
+            break;
+        }
+        AN_LOG("warning: the video memory is full: %s of the node went to shared memory, the node runs several times slower; "
+            "close programs that use the video card\n", fmt_gb((uint64_t) v.over()).c_str());
+        const uint64_t cut = (uint64_t) v.over() + margin;
+        if (!assigned || a.has("--vram-gb") || attempt >= 2 || cut >= slice_vram) {
+            break;
+        }
+        AN_LOG("node: asking the coordinator for fewer layers: %s of video memory for them instead of %s\n",
+            fmt_gb(slice_vram - cut).c_str(), fmt_gb(slice_vram).c_str());
+        srv.part.reset();
+        srv.model.reset();
+        slice_vram = prepare_assigned_slice(a, srv.mo, fingerprint, slice_vram - cut);
+    }
     srv.max_sessions = srv.part->n_seq;
     srv.batch_max    = (uint32_t) std::clamp(a.get_int("--batch-max", "", (int) srv.max_sessions), 1, 64);
     srv.start_worker();
@@ -1734,6 +1777,51 @@ static int cmd_node(const cli_args & a) {
         warmer.start(warm_ms, [&srv, warm_ms]() { return srv.waiting_with_session(warm_ms); });
     }
 
+    // the state of the node for the app (this line every 30 s) and for the coordinator (in the heartbeat)
+    auto status = [&srv, gpu]() {
+        const vram_state v = vram_probe(gpu);
+        int sessions;
+        {
+            std::lock_guard<std::mutex> lock(srv.mtx);
+            sessions = (int) srv.sessions.size();
+        }
+        json j = {
+            { "sessions", sessions },
+            { "max_sessions", srv.max_sessions },
+            { "batch_max", srv.batch_max },
+            { "forwards", srv.n_forwards.load() },
+            { "shared", srv.n_shared.load() },
+            { "vram_full", v.over() > 0 },
+        };
+        if (v.free >= 0) {
+            j["vram_free_mb"]  = v.free >> 20;
+            j["vram_total_mb"] = v.total >> 20;
+        }
+        if (v.shared >= 0) {
+            j["vram_shared_mb"] = v.shared >> 20;
+        }
+        return j;
+    };
+    std::thread([status]() {
+        bool full = false;
+        while (true) {
+            const json j = status();
+            printf("agent-node: status %s\n", j.dump().c_str());
+            fflush(stdout);
+            // the memory ran out while working (another program took it): once, until it is back
+            if (j.value("vram_full", false) != full) {
+                full = !full;
+                if (full) {
+                    AN_LOG("warning: the video memory is full: %lld MB of the node went to shared memory, the node runs several times "
+                        "slower; close programs that use the video card\n", (long long) j.value("vram_shared_mb", 0));
+                } else {
+                    AN_LOG("node: the layers are back in video memory\n");
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }
+    }).detach();
+
     tcp_listener ln(host, port);
     // the scripts wait for this line
     printf("agent-node ready on %s:%d%s%s\n", host.c_str(), port, fingerprint.empty() ? "" : " tls ", fingerprint.c_str());
@@ -1798,7 +1886,8 @@ static int cmd_node(const cli_args & a) {
             link.reg["account_token"] = acc.token;
             return true;
         };
-        link.work = [&srv]() { return srv.work_json(); };
+        link.work   = [&srv]() { return srv.work_json(); };
+        link.status = status;
         link.ended    = []() { return g_sessions_ended.load(); };
         link.sessions = [&srv]() {
             std::lock_guard<std::mutex> lock(srv.mtx);

@@ -75,6 +75,12 @@ a pass takes what came while the previous one ran.
   fewer sessions if they would not fit with `--vram-margin-mb 256` to spare; the coordinator gets the number in `max_sessions`.
 - `--batch-max N` forwards in a pass at most; `1` runs them one at a time (to compare).
 
+Every 30 s the node prints `agent-node: status {...}` (the app shows it) and sends the same in the heartbeat
+(`GET /v1/nodes` of the coordinator): sessions, `max_sessions`, forwards and those in shared passes, free video memory,
+and on Windows the shared memory of the node (`vram_shared_mb`, as in Task Manager). When the weights or the context
+do not fit, the Windows driver moves the rest to shared memory and the part runs several times slower: the node warns,
+and with layers from the coordinator (`--model-url`) it asks at once for fewer (up to two times).
+
 ## Security
 
 - **Access tokens.** A node started with `--key HEX` (or `AGENT_NODE_KEY`) accepts a session (`open`) and a previous
