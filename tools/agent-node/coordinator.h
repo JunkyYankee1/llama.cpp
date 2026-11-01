@@ -83,6 +83,7 @@ struct coord_link {
     std::function<int()>     sessions; // open sessions now
     std::function<uint64_t()> ended;   // sessions ended so far (a counter): a change sends a heartbeat at once
     std::function<json()>    work;     // tokens per session that went through the node (for the points of the owner)
+    std::function<json()>    status;   // the state of the node: sessions, passes, video memory (GET /v1/nodes shows it)
     // the coordinator does not know the account of the registration (restarted with the in-memory store):
     // make a new one and put its token into reg; false: no account
     std::function<bool()>    renew_account;
@@ -127,6 +128,9 @@ struct coord_link {
                     json beat = { { "sessions", last_beat } };
                     if (work) {
                         beat["work"] = work();
+                    }
+                    if (status) {
+                        beat["status"] = status();
                     }
                     const http_reply r = coord_post(url, "/v1/nodes/" + id + "/heartbeat", beat, h);
                     if (r.status == 404) {
