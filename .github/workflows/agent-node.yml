@@ -120,3 +120,4 @@ jobs:
           $out = & build\bin\agent-node.exe 2>&1 | Out-String
           if ($out -notmatch 'usage:') { Write-Host $out; exit 1 }
           Write-Host 'agent-node.exe запускается'
+          exit 0 # код выхода справки — не ошибка шага
