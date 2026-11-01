@@ -109,6 +109,7 @@ struct cli_args {
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
+            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -260,18 +261,43 @@ static void top_k(const float * logits, int32_t n_vocab, uint32_t k, top_entry *
     }
 }
 
+// one forward frame of one sequence; the forwards of several sequences run in one pass (model_part::run_batch)
+struct part_job {
+    forward_hdr     h;
+    const uint8_t * data  = nullptr;
+    llama_seq_id    seq   = 0;
+    uint32_t        n_top = 8;
+
+    // results: not the last part: hidden gets n_tokens rows of n_embd, the last part: top gets n_out rows of n_top
+    std::vector<float>     hidden;
+    std::vector<top_entry> top;
+    uint32_t               n_out = 0;
+    std::string            err;          // this forward failed; the other forwards of the pass are not affected
+    double                 pass_ms = 0;  // time of the pass and of reading its outputs
+    double                 output_ms = 0;
+    uint32_t               n_pass  = 0;  // forwards in the pass
+
+    std::vector<float> hidden_in; // the hidden states of the input as f32: the batch only points at them
+    int32_t            i0 = 0;    // batch index of the first token
+};
+
 struct model_part {
     const llama_model * model = nullptr;
     llama_context_ptr   ctx;
-    int32_t first = 0, last = 0, n_layer = 0, n_embd = 0, n_vocab = 0;
-    int32_t n_batch = 512;
-    int32_t n_past  = 0; // tokens in the memory: the next forward continues at this position
-    double  last_output_ms = 0; // time of reading the outputs in the last run()
-
-    std::vector<float> hidden_in;
+    int32_t  first = 0, last = 0, n_layer = 0, n_embd = 0, n_vocab = 0;
+    int32_t  n_batch = 512;
+    uint32_t n_seq = 1, n_rollback = 0;
+    std::vector<int32_t> n_past; // tokens of each sequence in the memory: its next forward continues at this position
+    double   last_output_ms = 0; // time of reading the outputs in the last pass
 
     // n_rollback: how many trailing tokens of a forward can be rolled back (speculative decoding)
-    model_part(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_rollback = 0) : model(model) {
+    // n_seq > 1: one context for several sequences, n_ctx tokens shared by them all (a unified cache: llama.cpp puts
+    // sequences with separate caches into one pass only when their ids follow one another, and sessions end in any order)
+    model_part(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_rollback = 0,
+            uint32_t n_seq = 1) : model(model), n_seq(n_seq), n_rollback(n_rollback), n_past(n_seq, 0) {
+        if (n_seq == 0 || n_seq > 64) {
+            throw std::runtime_error("1..64 sequences in a context");
+        }
         n_layer = llama_model_n_layer(model);
         n_embd  = llama_model_n_embd(model);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -282,7 +308,8 @@ struct model_part {
         cp.n_ctx           = n_ctx;
         cp.n_batch         = n_batch;
         cp.n_ubatch        = n_batch;
-        cp.n_seq_max       = 1;
+        cp.n_seq_max       = n_seq;
+        cp.kv_unified      = n_seq > 1;
         // recurrent layers (Gated DeltaNet) keep snapshots of their state to undo rejected draft tokens
         cp.n_rs_seq        = n_rollback;
         cp.n_threads       = n_threads;
@@ -301,92 +328,165 @@ struct model_part {
     bool is_first() const { return first == 0; }
     bool is_last () const { return last == n_layer; }
 
-    // runs the tokens or the hidden states of one forward frame
-    // not the last part: hidden_out gets n_tokens rows of n_embd, the last part: top gets n_out rows of n_top
+    // the sequence ended: its tokens leave the memory
+    void clear(llama_seq_id seq) {
+        llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, -1, -1);
+        n_past[seq] = 0;
+    }
+
+    // runs the tokens or the hidden states of one forward frame of sequence 0
     void run(const forward_hdr & h, const uint8_t * data,
             std::vector<float> & hidden_out, std::vector<top_entry> & top, uint32_t n_top, uint32_t & n_out) {
+        part_job j;
+        j.h     = h;
+        j.data  = data;
+        j.n_top = n_top;
+        part_job * jobs[] = { &j };
+        run_batch(jobs, 1);
+        if (!j.err.empty()) {
+            throw std::runtime_error(j.err);
+        }
+        hidden_out.swap(j.hidden);
+        top.swap(j.top);
+        n_out = j.n_out;
+    }
+
+    // runs the forwards of different sequences in one pass, at most n_batch tokens in all
+    void run_batch(part_job * const * jobs, size_t n_jobs) {
+        common_batch batch(ctx.get());
+        std::vector<part_job *> run;
+        uint64_t seqs = 0; // up to 64 sequences
+        for (size_t k = 0; k < n_jobs; k++) {
+            part_job & j = *jobs[k];
+            j.err.clear();
+            try {
+                add(j, batch, seqs);
+                run.push_back(&j);
+            } catch (const std::exception & e) {
+                j.err = e.what();
+            }
+        }
+        if (run.empty()) {
+            return;
+        }
+
+        const double t0 = now_ms();
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            for (part_job * j : run) {
+                j->err = "llama_process failed at position " + std::to_string(j->h.pos0);
+            }
+            return;
+        }
+        const double t_out = now_ms();
+        for (part_job * j : run) {
+            n_past[j->seq] = j->h.pos0 + (int32_t) j->h.n_tokens;
+            j->n_pass = (uint32_t) run.size();
+            try {
+                read(*j);
+            } catch (const std::exception & e) {
+                j->err = e.what();
+            }
+        }
+        last_output_ms = now_ms() - t_out;
+        for (part_job * j : run) {
+            j->pass_ms   = now_ms() - t0;
+            j->output_ms = last_output_ms;
+        }
+    }
+
+private:
+    void add(part_job & j, common_batch & batch, uint64_t & seqs) {
+        const forward_hdr & h = j.h;
+        if (j.seq < 0 || (uint32_t) j.seq >= n_seq) {
+            throw std::runtime_error("sequence " + std::to_string(j.seq) + " out of range");
+        }
+        if (seqs & (1ull << j.seq)) {
+            throw std::runtime_error("two forwards of one sequence in a pass");
+        }
         if (h.n_tokens == 0 || (int32_t) h.n_tokens > n_batch) {
             throw std::runtime_error("forward must carry 1.." + std::to_string(n_batch) + " tokens");
         }
+        if (batch.size() + (int32_t) h.n_tokens > n_batch) {
+            throw std::runtime_error("the pass is full");
+        }
         const bool out_all = h.flags & FORWARD_OUT_ALL;
-
-        // a forward that starts before the end of the previous one drops the rejected draft tokens
-        if (h.pos0 > n_past) {
-            throw std::runtime_error("forward at position " + std::to_string(h.pos0) + " leaves a gap after " + std::to_string(n_past));
-        }
-        if (h.pos0 < n_past) {
-            if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, h.pos0, -1)) {
-                throw std::runtime_error("cannot roll back from " + std::to_string(n_past) + " to " + std::to_string(h.pos0) +
-                    " (at most n_rollback tokens of the last forward)");
-            }
-            n_past = h.pos0;
-        }
-
-        common_batch batch(ctx.get());
         if (h.kind == payload::tokens) {
             if (!is_first()) {
                 throw std::runtime_error("this node runs layers from " + std::to_string(first) + " and takes hidden states, not tokens");
-            }
-            const int32_t * ids = (const int32_t *) data;
-            for (uint32_t i = 0; i < h.n_tokens; i++) {
-                const bool out = !is_last() || out_all || i + 1 == h.n_tokens;
-                batch.add(ids[i], h.pos0 + (int32_t) i, 0, out);
             }
         } else if (h.kind == payload::f16 || h.kind == payload::f32 || h.kind == payload::q8) {
             if (is_first()) {
                 throw std::runtime_error("the first node takes tokens, not hidden states");
             }
-            hidden_in.resize((size_t) h.n_tokens * n_embd);
-            if (h.kind == payload::f16) {
-                ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, hidden_in.data(), (int64_t) hidden_in.size());
-            } else if (h.kind == payload::q8) {
-                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(data, hidden_in.data(), (int64_t) hidden_in.size());
-            } else {
-                memcpy(hidden_in.data(), data, hidden_in.size() * sizeof(float));
-            }
-            for (uint32_t i = 0; i < h.n_tokens; i++) {
-                const llama_pos p = h.pos0 + (llama_pos) i;
-                // text positions, for M-RoPE they expand to [p, p, p, 0]
-                const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
-                const bool out = !is_last() || out_all || i + 1 == h.n_tokens;
-                batch.add_embd({ hidden_in.data() + (size_t) i * n_embd, 1, (size_t) n_embd }, pos, 0, out);
-            }
         } else {
             throw std::runtime_error("unknown payload kind");
         }
 
-        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
-            throw std::runtime_error("llama_process failed at position " + std::to_string(h.pos0));
+        // a forward that starts before the end of the previous one drops the rejected draft tokens
+        int32_t & past = n_past[j.seq];
+        if (h.pos0 > past) {
+            throw std::runtime_error("forward at position " + std::to_string(h.pos0) + " leaves a gap after " + std::to_string(past));
         }
-        n_past = h.pos0 + (int32_t) h.n_tokens;
-        const double t_out = now_ms();
-        struct out_timer {
-            double t0; double & dst;
-            ~out_timer() { dst = now_ms() - t0; }
-        } timer { t_out, last_output_ms };
+        if (h.pos0 < past) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), j.seq, h.pos0, -1)) {
+                throw std::runtime_error("cannot roll back from " + std::to_string(past) + " to " + std::to_string(h.pos0) +
+                    " (at most n_rollback tokens of the last forward)");
+            }
+            past = h.pos0;
+        }
 
-        if (!is_last()) {
-            hidden_out.resize((size_t) h.n_tokens * n_embd);
+        seqs |= 1ull << j.seq;
+        j.i0 = batch.size();
+        if (h.kind == payload::tokens) {
+            const int32_t * ids = (const int32_t *) j.data;
             for (uint32_t i = 0; i < h.n_tokens; i++) {
-                const float * e = llama_get_embeddings_ith(ctx.get(), (int32_t) i);
+                const bool out = !is_last() || out_all || i + 1 == h.n_tokens;
+                batch.add(ids[i], h.pos0 + (int32_t) i, j.seq, out);
+            }
+            return;
+        }
+        j.hidden_in.resize((size_t) h.n_tokens * n_embd);
+        if (h.kind == payload::f16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) j.data, j.hidden_in.data(), (int64_t) j.hidden_in.size());
+        } else if (h.kind == payload::q8) {
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(j.data, j.hidden_in.data(), (int64_t) j.hidden_in.size());
+        } else {
+            memcpy(j.hidden_in.data(), j.data, j.hidden_in.size() * sizeof(float));
+        }
+        for (uint32_t i = 0; i < h.n_tokens; i++) {
+            const llama_pos p = h.pos0 + (llama_pos) i;
+            // text positions, for M-RoPE they expand to [p, p, p, 0]
+            const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
+            const bool out = !is_last() || out_all || i + 1 == h.n_tokens;
+            batch.add_embd({ j.hidden_in.data() + (size_t) i * n_embd, 1, (size_t) n_embd }, pos, j.seq, out);
+        }
+    }
+
+    void read(part_job & j) {
+        const forward_hdr & h = j.h;
+        if (!is_last()) {
+            j.hidden.resize((size_t) h.n_tokens * n_embd);
+            for (uint32_t i = 0; i < h.n_tokens; i++) {
+                const float * e = llama_get_embeddings_ith(ctx.get(), j.i0 + (int32_t) i);
                 if (e == nullptr) {
                     throw std::runtime_error("no hidden state for token " + std::to_string(i));
                 }
-                memcpy(hidden_out.data() + (size_t) i * n_embd, e, (size_t) n_embd * sizeof(float));
+                memcpy(j.hidden.data() + (size_t) i * n_embd, e, (size_t) n_embd * sizeof(float));
             }
-            n_out = 0;
+            j.n_out = 0;
             return;
         }
 
-        n_out = out_all ? h.n_tokens : 1;
-        top.resize((size_t) n_out * n_top);
-        for (uint32_t o = 0; o < n_out; o++) {
-            const int32_t i = out_all ? (int32_t) o : (int32_t) h.n_tokens - 1;
+        const bool out_all = h.flags & FORWARD_OUT_ALL;
+        j.n_out = out_all ? h.n_tokens : 1;
+        j.top.resize((size_t) j.n_out * j.n_top);
+        for (uint32_t o = 0; o < j.n_out; o++) {
+            const int32_t i = j.i0 + (out_all ? (int32_t) o : (int32_t) h.n_tokens - 1);
             const float * logits = llama_get_logits_ith(ctx.get(), i);
             if (logits == nullptr) {
-                throw std::runtime_error("no logits for token " + std::to_string(i));
+                throw std::runtime_error("no logits for token " + std::to_string(i - j.i0));
             }
-            top_k(logits, n_vocab, n_top, top.data() + (size_t) o * n_top);
+            top_k(logits, n_vocab, j.n_top, j.top.data() + (size_t) o * j.n_top);
         }
     }
 };
@@ -401,6 +501,12 @@ static std::atomic<uint64_t> g_sessions_ended{0};
 struct session {
     ~session() {
         g_sessions_ended++;
+        if (n_forward > 0) {
+            AN_LOG("session %" PRIu64 ": %" PRIu64 " forwards, %" PRIu64 " of them in passes with other sessions\n", id, n_forward, n_shared);
+        }
+        if (release) {
+            release();
+        }
         // the connection to the next node belongs to the session: closing it ends the thread that reads it and,
         // on the next node, the side of the session that came from here
         if (next) {
@@ -408,7 +514,10 @@ struct session {
         }
     }
     uint64_t                    id = 0;
-    std::unique_ptr<model_part> part;
+    llama_seq_id                seq   = -1; // in the context of the node
+    uint32_t                    n_ctx = 0;
+    std::function<void()>       release;    // gives the sequence back to the node
+    uint64_t                    n_forward = 0, n_shared = 0;
     uint32_t                    n_top = 8;
     payload                     hidden = payload::f16;
     tcp_conn_ptr                owner; // the client that opened the session, gets the results of the last node
@@ -491,6 +600,117 @@ struct node_server {
     model_opts      mo;
     int32_t         n_threads = 4;
     uint32_t        max_sessions = 4;
+
+    // one context for all sessions (a sequence each): the worker runs the forwards that wait at the moment
+    // in one pass, and the weights of the part are read once for them all (docs/Параллельные сессии.md)
+    std::unique_ptr<model_part> part;
+    uint32_t                    batch_max = 4;  // forwards in one pass; 1: one at a time
+
+    struct fwd_job : part_job {
+        bool done = false;
+    };
+    std::mutex                q_mtx;
+    std::condition_variable   q_cv, q_done;
+    std::deque<fwd_job *>     queue;
+    std::vector<llama_seq_id> free_seqs, ended_seqs; // ended: the worker clears them first
+    uint64_t                  ctx_used = 0;          // tokens of the context promised to open sessions
+
+    void start_worker() {
+        for (uint32_t i = part->n_seq; i-- > 0;) {
+            free_seqs.push_back((llama_seq_id) i);
+        }
+        std::thread([this]() { worker(); }).detach();
+    }
+
+    void worker() {
+        std::vector<fwd_job *>    pass;
+        std::vector<llama_seq_id> ended;
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(q_mtx);
+                q_cv.wait(lock, [&]() { return !queue.empty() || !ended_seqs.empty(); });
+                ended.swap(ended_seqs);
+                // in the order of arrival; a session has at most one forward in the queue (its connection waits for it)
+                pass.clear();
+                uint64_t seqs = 0;
+                int32_t  n_tokens = 0;
+                for (auto it = queue.begin(); it != queue.end() && pass.size() < batch_max;) {
+                    fwd_job * j = *it;
+                    if ((seqs & (1ull << j->seq)) || (!pass.empty() && n_tokens + (int32_t) j->h.n_tokens > part->n_batch)) {
+                        ++it;
+                        continue;
+                    }
+                    seqs |= 1ull << j->seq;
+                    n_tokens += (int32_t) j->h.n_tokens;
+                    pass.push_back(j);
+                    it = queue.erase(it);
+                }
+            }
+            if (!ended.empty()) {
+                for (llama_seq_id seq : ended) {
+                    part->clear(seq);
+                }
+                std::lock_guard<std::mutex> lock(q_mtx);
+                free_seqs.insert(free_seqs.end(), ended.begin(), ended.end());
+                ended.clear();
+            }
+            if (pass.empty()) {
+                continue;
+            }
+            {
+                busy_guard guard(*this);
+                std::vector<part_job *> jobs(pass.begin(), pass.end());
+                part->run_batch(jobs.data(), jobs.size());
+            }
+            {
+                std::lock_guard<std::mutex> lock(q_mtx);
+                for (fwd_job * j : pass) {
+                    j->done = true;
+                }
+            }
+            q_done.notify_all();
+        }
+    }
+
+    // runs the forward in the next pass of the worker
+    void run_queued(fwd_job & j) {
+        std::unique_lock<std::mutex> lock(q_mtx);
+        queue.push_back(&j);
+        q_cv.notify_one();
+        q_done.wait(lock, [&]() { return j.done; });
+    }
+
+    // a sequence of the context for a new session, with n_ctx tokens of it
+    llama_seq_id take_seq(uint32_t n_ctx) {
+        std::lock_guard<std::mutex> lock(q_mtx);
+        const uint64_t total = llama_n_ctx(part->ctx.get());
+        if (free_seqs.empty()) {
+            throw std::runtime_error("too many sessions (" + std::to_string(part->n_seq) + ")");
+        }
+        if (ctx_used + n_ctx > total) {
+            throw std::runtime_error("no room for a context of " + std::to_string(n_ctx) + " tokens: " +
+                std::to_string(total - ctx_used) + " of " + std::to_string(total) + " are free");
+        }
+        const llama_seq_id seq = free_seqs.back();
+        free_seqs.pop_back();
+        ctx_used += n_ctx;
+        return seq;
+    }
+
+    void give_back_seq(llama_seq_id seq, uint32_t n_ctx) {
+        {
+            std::lock_guard<std::mutex> lock(q_mtx);
+            ended_seqs.push_back(seq);
+            ctx_used -= n_ctx;
+        }
+        q_cv.notify_one();
+    }
+
+    struct busy_guard {
+        node_server & srv;
+        busy_guard(node_server & srv) : srv(srv) { srv.busy++; }
+        ~busy_guard() { srv.last_end_us = (int64_t) (now_ms() * 1000); srv.busy--; }
+    };
 
     // for the GPU warmer: forwards running now and the end of the last one
     std::atomic<int>     busy{ 0 };
@@ -603,12 +823,17 @@ struct node_server {
         }
         s->hidden = m.hidden;
         s->owner = conn;
-        s->part  = std::make_unique<model_part>(model.get(), mo, m.n_ctx, n_threads, std::min<uint32_t>(m.n_rollback, 32));
-
-        if (s->part->is_last() != m.next.empty()) {
-            throw std::runtime_error(s->part->is_last() ? "this node runs the last layers, it has no next node"
-                                                        : "this node does not run the last layers, it needs a next node");
+        if (part->is_last() != m.next.empty()) {
+            throw std::runtime_error(part->is_last() ? "this node runs the last layers, it has no next node"
+                                                     : "this node does not run the last layers, it needs a next node");
         }
+        if (m.n_rollback > part->n_rollback) {
+            throw std::runtime_error("this node rolls back at most " + std::to_string(part->n_rollback) + " draft tokens, the session asks for " +
+                std::to_string(m.n_rollback) + " (agent-node node --seq-rollback)");
+        }
+        s->n_ctx   = std::max<uint32_t>(m.n_ctx, 1);
+        s->seq     = take_seq(s->n_ctx);
+        s->release = [this, seq = s->seq, n = s->n_ctx]() { give_back_seq(seq, n); };
         if (!m.next.empty()) {
             s->next = secure_connect(m.next, client_ctx, m.next_pin);
             attach_msg am;
@@ -634,19 +859,19 @@ struct node_server {
         }
 
         open_ok_msg ok;
-        ok.layer_start = s->part->first;
-        ok.layer_end   = s->part->last;
-        ok.n_layer     = s->part->n_layer;
-        ok.n_embd      = s->part->n_embd;
-        ok.n_vocab     = s->part->n_vocab;
+        ok.layer_start = part->first;
+        ok.layer_end   = part->last;
+        ok.n_layer     = part->n_layer;
+        ok.n_embd      = part->n_embd;
+        ok.n_vocab     = part->n_vocab;
         ok.desc        = model_desc(model.get());
         {
             std::lock_guard<std::mutex> lock(mtx);
             sessions[m.session] = s;
         }
         authed.insert(m.session);
-        AN_LOG("session %" PRIu64 ": layers [%d, %d), n_ctx = %u, next = %s\n",
-            m.session, ok.layer_start, ok.layer_end, m.n_ctx, m.next.empty() ? "(client)" : m.next.c_str());
+        AN_LOG("session %" PRIu64 ": layers [%d, %d), n_ctx = %u, sequence %d, next = %s\n",
+            m.session, ok.layer_start, ok.layer_end, m.n_ctx, (int) s->seq, m.next.empty() ? "(client)" : m.next.c_str());
         send_frame(*conn, msg::open_ok, ok.write());
     }
 
@@ -655,31 +880,36 @@ struct node_server {
         forward_hdr h = forward_hdr::read(r);
         auto s = find(h.session);
 
-        std::lock_guard<std::mutex> lock(s->mtx);
-        model_part & p = *s->part;
+        const model_part & p = *part;
         const size_t need = payload_size(h.kind, h.n_tokens, p.n_embd);
         const uint8_t * data = r.get_bytes(need);
+        if ((uint64_t) h.pos0 + h.n_tokens > s->n_ctx) {
+            throw std::runtime_error("forward ends at position " + std::to_string((uint64_t) h.pos0 + h.n_tokens) +
+                ", past the context of the session (" + std::to_string(s->n_ctx) + ")");
+        }
 
+        fwd_job j;
+        j.h     = h;
+        j.data  = data;
+        j.seq   = s->seq;
+        j.n_top = s->n_top;
+        run_queued(j);
+        if (!j.err.empty()) {
+            throw std::runtime_error(j.err);
+        }
+        std::vector<float> &     hidden = j.hidden;
+        std::vector<top_entry> & top    = j.top;
+        const uint32_t           n_out  = j.n_out;
+
+        std::lock_guard<std::mutex> lock(s->mtx);
         s->st.bytes_in += 5 + body.size();
         s->st.n_tokens += h.n_tokens;
         s->st.n_forward++;
+        s->n_forward++;
+        s->n_shared += j.n_pass > 1;
         count_work(h.session, h.n_tokens);
-
-        static thread_local std::vector<float>     hidden;
-        static thread_local std::vector<top_entry> top;
-        uint32_t n_out = 0;
-
-        const double t0 = now_ms();
-        {
-            struct busy_guard {
-                node_server & srv;
-                busy_guard(node_server & srv) : srv(srv) { srv.busy++; }
-                ~busy_guard() { srv.last_end_us = (int64_t) (now_ms() * 1000); srv.busy--; }
-            } guard(*this);
-            p.run(h, data, hidden, top, s->n_top, n_out);
-        }
-        s->st.compute_ms += now_ms() - t0;
-        s->st.output_ms  += p.last_output_ms;
+        s->st.compute_ms += j.pass_ms;
+        s->st.output_ms  += j.output_ms;
         if (corrupt > 0) {
             // a node that saves work: its outputs are partly made up
             static thread_local std::mt19937 rng(7);
@@ -844,6 +1074,39 @@ static double measure_ms_per_layer(const llama_model * model, const model_opts &
         p.run(h, p.is_first() ? (const uint8_t *) &tok : (const uint8_t *) in.data(), hidden, top, 8, n_out);
     }
     return (now_ms() - t0) / n_run / std::max(1, p.last - p.first);
+}
+
+// the context of a node for up to `want` sessions of n_ctx tokens each: on a GPU fewer, if the memory of the video card
+// would not hold them with `margin` bytes to spare (beyond it the driver moves weights to shared memory, bench/RESULTS.md).
+// The memory per session (KV cache, DeltaNet states with their rollback snapshots) is measured with contexts for 1 and 2
+static std::unique_ptr<model_part> make_node_part(const llama_model * model, const model_opts & mo, int32_t n_threads,
+        uint32_t want, uint32_t n_ctx, uint32_t n_rollback, uint64_t margin) {
+    ggml_backend_dev_t dev = mo.device.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
+                                               : ggml_backend_dev_by_name(mo.device.c_str());
+    uint32_t n = want;
+    if (want > 1 && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        auto free_mem = [dev]() {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            return (int64_t) free;
+        };
+        const int64_t f0 = free_mem();
+        int64_t f1, f2;
+        {
+            model_part p(model, mo, n_ctx, n_threads, n_rollback, 1);
+            f1 = free_mem();
+        }
+        {
+            model_part p(model, mo, 2 * n_ctx, n_threads, n_rollback, 2);
+            f2 = free_mem();
+        }
+        const int64_t per  = std::max<int64_t>(f1 - f2, 1);
+        const int64_t base = f0 - f1 - per; // compute buffers
+        n = (uint32_t) std::clamp<int64_t>((f0 - (int64_t) margin - base) / per, 1, want);
+        AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the context %.0f MiB more: %u of %u sessions fit with %.0f MiB to spare\n",
+            f0 / 1048576.0, per / 1048576.0, std::max<int64_t>(base, 0) / 1048576.0, n, want, margin / 1048576.0);
+    }
+    return std::make_unique<model_part>(model, mo, n * n_ctx, n_threads, n_rollback, n);
 }
 
 //
@@ -1394,6 +1657,16 @@ static int cmd_node(const cli_args & a) {
         ms_per_layer = measure_ms_per_layer(srv.model.get(), srv.mo, srv.n_threads);
         AN_LOG("node: %.3f ms per layer per token\n", ms_per_layer);
     }
+
+    // one context for the sessions: --max-sessions of --seq-ctx tokens, rolling back up to --seq-rollback draft tokens
+    srv.part = make_node_part(srv.model.get(), srv.mo, srv.n_threads, (uint32_t) std::clamp(a.get_int("--max-sessions", "", 4), 1, 64),
+        (uint32_t) a.get_int("--seq-ctx", "", 16384), (uint32_t) std::clamp(a.get_int("--seq-rollback", "", 6), 0, 32),
+        (uint64_t) a.get_int("--vram-margin-mb", "", 256) << 20);
+    srv.max_sessions = srv.part->n_seq;
+    srv.batch_max    = (uint32_t) std::clamp(a.get_int("--batch-max", "", (int) srv.max_sessions), 1, 64);
+    srv.start_worker();
+    AN_LOG("node: %u sessions of up to %u tokens, up to %u forwards in one pass\n", srv.max_sessions,
+        llama_n_ctx(srv.part->ctx.get()) / srv.max_sessions, srv.batch_max);
 
     // hold the GPU clocks while there are sessions: between tokens the GPU would drop to a power-saving state
     static gpu_clocks clocks; // static: the console handler resets the clocks when the window is closed
@@ -3841,6 +4114,9 @@ static void usage() {
         "security: node [--key HEX | env AGENT_NODE_KEY] [--tls --identity node.pem]\n"
         "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
         "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
+        "sessions: node [--max-sessions 4] [--seq-ctx 16384] [--seq-rollback 6] [--vram-margin-mb 256] [--batch-max N]\n"
+        "               one context for the sessions, fewer if the GPU memory runs short; the forwards waiting at the moment\n"
+        "               run in one pass (--batch-max 1: one at a time)\n"
         "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"

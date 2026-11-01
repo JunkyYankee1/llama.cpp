@@ -62,6 +62,19 @@ Frames are `u32 body size | u8 type | body`, little-endian, see `protocol.h`:
 The client opens the session from the last node to the first one, so that every node can attach to the
 already open session of its next node. The client checks that the layer ranges cover the model without gaps.
 
+## Sessions on one node
+
+A node keeps one context for all its sessions, a sequence of it for each. The forwards that wait at the node
+at the moment (of different sessions) run in one pass, so the weights of the part are read once for them all:
+on an RTX 5060 Ti four sessions get 2.7 times the tokens per second of one. Nothing waits for a pass to fill up:
+a pass takes what came while the previous one ran.
+
+- `--max-sessions 4` sequences of `--seq-ctx 16384` tokens; a session asks for its `n_ctx` out of them.
+- `--seq-rollback 6`: how many draft tokens a session may roll back (`n_rollback` of `open`, the `--draft-max` of the client).
+- On a GPU the node measures the memory of a session (KV cache, DeltaNet states and their snapshots) and takes
+  fewer sessions if they would not fit with `--vram-margin-mb 256` to spare; the coordinator gets the number in `max_sessions`.
+- `--batch-max N` forwards in a pass at most; `1` runs them one at a time (to compare).
+
 ## Security
 
 - **Access tokens.** A node started with `--key HEX` (or `AGENT_NODE_KEY`) accepts a session (`open`) and a previous
