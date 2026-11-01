@@ -17,6 +17,8 @@
 #    endif
 #    include <windows.h>
 #    include <dxgi1_4.h>
+// the COM headers define small as char (rpcndr.h): it breaks variables of that name
+#    undef small
 #    define AGENT_HAVE_DXGI
 #endif
 
