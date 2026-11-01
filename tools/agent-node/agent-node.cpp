@@ -183,6 +183,8 @@ struct model_opts {
     // 8 work per token and the same ones are needed often, the cache keeps them. On an RTX 5060 Ti with 3 GB of cache
     // 4 sessions get 2.3 times the tokens per second of all experts on the CPU, 10 layers of experts on the GPU 1.4 times
     uint64_t    moe_cache_bytes = 0;
+    // the cache took what the video memory had left (no --moe-cache-mib): make_node_part may cut it for the sessions
+    bool        moe_cache_auto  = false;
 };
 
 // the number of layers from the metadata of a GGUF file, without loading it
@@ -1188,7 +1190,9 @@ static double measure_ms_per_layer(const llama_model * model, const model_opts &
 // the context of a node for up to `want` sessions of n_ctx tokens each: on a GPU fewer, if the memory of the video card
 // would not hold them with `margin` bytes to spare (beyond it the driver moves weights to shared memory, bench/RESULTS.md).
 // The memory per session (KV cache, DeltaNet states with their rollback snapshots) is measured with contexts for 1 and 2
-static std::unique_ptr<model_part> make_node_part(const llama_model * model, const model_opts & mo, int32_t n_threads,
+// The automatic expert cache gives way to the sessions, down to half of it: a session is a user served, and 4 sessions
+// in one pass give more tokens per second than 2 with a bigger cache (docs/Параллельные сессии.md)
+static std::unique_ptr<model_part> make_node_part(const llama_model * model, model_opts & mo, int32_t n_threads,
         uint32_t want, uint32_t n_ctx, uint32_t n_rollback, uint64_t margin) {
     ggml_backend_dev_t dev = mo.device.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)
                                                : ggml_backend_dev_by_name(mo.device.c_str());
@@ -1210,8 +1214,17 @@ static std::unique_ptr<model_part> make_node_part(const llama_model * model, con
             f2 = free_mem();
         }
         const int64_t per  = std::max<int64_t>(f1 - f2, 1);
-        const int64_t base = f0 - f1 - per; // compute buffers
+        int64_t base = f0 - f1 - per; // compute buffers and the expert cache
         n = (uint32_t) std::clamp<int64_t>((f0 - (int64_t) margin - base) / per, 1, want);
+        if (n < want && mo.moe_cache_auto) {
+            const int64_t short_by = (int64_t) want * per + base + (int64_t) margin - f0;
+            const int64_t cut = std::min<int64_t>((short_by + (1 << 20) - 1) & ~((int64_t) (1 << 20) - 1), (int64_t) mo.moe_cache_bytes / 2);
+            AN_LOG("node: %u of %u sessions fit, the expert cache %.0f -> %.0f MiB for more\n", n, want,
+                mo.moe_cache_bytes / 1048576.0, (mo.moe_cache_bytes - cut) / 1048576.0);
+            mo.moe_cache_bytes -= cut;
+            base -= cut;
+            n = (uint32_t) std::clamp<int64_t>((f0 - (int64_t) margin - base) / per, 1, want);
+        }
         AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the context %.0f MiB more: %u of %u sessions fit with %.0f MiB to spare\n",
             f0 / 1048576.0, per / 1048576.0, std::max<int64_t>(base, 0) / 1048576.0, n, want, margin / 1048576.0);
     }
@@ -1489,6 +1502,7 @@ static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, cons
             if (mo.moe_cache_bytes < (64ull << 20)) {
                 mo.moe_cache_bytes = 0;
             }
+            mo.moe_cache_auto = !a.has("--moe-cache-mib") && mo.moe_cache_bytes > 0;
             gpu_experts = mo.moe_cache_bytes;
             AN_LOG("node: the experts in RAM (%s), a cache of %s of them on the GPU\n", fmt_gb(all).c_str(), fmt_gb(gpu_experts).c_str());
         }
