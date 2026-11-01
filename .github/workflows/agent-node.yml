@@ -1,0 +1,122 @@
+# agent-node: проверка до слияния в agent/node.
+#   linux   — сборка и тесты цепочки на процессоре с Qwen3.5-0.8B (tools/agent-node/tests/run.sh): пакеты сессий,
+#             откат черновика, кэш разговора в serve; сборка для Linux — в артефакте
+#   windows — сборка MSVC без CUDA: ловит ошибки, которые видит только компилятор Windows (сборка с CUDA и Vulkan
+#             для участников — в основном репозитории, около часа)
+name: agent-node
+
+on:
+  pull_request:
+    branches: [agent/node]
+    paths:
+      - 'tools/agent-node/**'
+      - 'src/**'
+      - 'include/**'
+      - 'common/**'
+      - 'ggml/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/agent-node.yml'
+  push:
+    branches: [agent/node]
+    paths:
+      - 'tools/agent-node/**'
+      - 'src/**'
+      - 'include/**'
+      - 'common/**'
+      - 'ggml/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/agent-node.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: agent-node-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux — сборка и тесты цепочки
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Кэш компиляции
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: agent-node-linux
+          evict-old-files: 7d
+
+      - name: Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+
+      - name: Сборка
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build -j "$(nproc)" --target agent-node
+
+      - name: Модель для тестов
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: qwen3.5-0.8b-q8_0
+
+      - name: Скачать модель (Qwen3.5-0.8B, 0,8 ГБ)
+        run: |
+          [ -f models/Qwen3.5-0.8B-Q8_0.gguf ] || curl -fL --retry 3 --create-dirs -o models/Qwen3.5-0.8B-Q8_0.gguf \
+            https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf
+
+      - name: Тесты
+        run: tools/agent-node/tests/run.sh build/bin/agent-node models/Qwen3.5-0.8B-Q8_0.gguf "$RUNNER_TEMP/agent-node-tests"
+
+      - name: Журналы тестов
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-node-tests-logs
+          path: ${{ runner.temp }}/agent-node-tests
+          retention-days: 7
+
+      - name: Сборка для Linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-node-linux-x64
+          path: build/bin/agent-node
+          retention-days: 14
+
+  windows:
+    name: Windows — сборка MSVC без CUDA
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Кэш компиляции
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: agent-node-windows-cpu
+          evict-old-files: 7d
+
+      - name: Ninja
+        run: choco install ninja
+
+      - name: Сборка
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_AVX2=ON ^
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_BORINGSSL=ON
+          if errorlevel 1 exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% --target agent-node
+          if errorlevel 1 exit /b 1
+
+      - name: Запуск
+        shell: pwsh
+        run: |
+          # без аргументов agent-node печатает справку и выходит с ошибкой; важно, что он запускается
+          $out = & build\bin\agent-node.exe 2>&1 | Out-String
+          if ($out -notmatch 'usage:') { Write-Host $out; exit 1 }
+          Write-Host 'agent-node.exe запускается'

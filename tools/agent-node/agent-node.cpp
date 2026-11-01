@@ -656,8 +656,12 @@ struct node_server {
     uint32_t                    batch_max = 4;  // forwards in one pass; 1: one at a time
 
     struct fwd_job : part_job {
-        bool done = false;
+        bool done    = false;
+        bool waited  = false; // a long forward let the short ones go first once
     };
+    // a forward this long (reading a prompt) waits for one pass when short ones (generation steps) wait too: else
+    // every session at the node would wait for it, and on a slow node their clients time out
+    static constexpr uint32_t long_forward = 64;
     std::mutex                q_mtx;
     std::condition_variable   q_cv, q_done;
     std::deque<fwd_job *>     queue;
@@ -685,8 +689,14 @@ struct node_server {
                 pass.clear();
                 uint64_t seqs = 0;
                 int32_t  n_tokens = 0;
+                const bool short_waits = std::any_of(queue.begin(), queue.end(), [](const fwd_job * j) { return j->h.n_tokens < long_forward; });
                 for (auto it = queue.begin(); it != queue.end() && pass.size() < batch_max;) {
                     fwd_job * j = *it;
+                    if (short_waits && j->h.n_tokens >= long_forward && !j->waited) {
+                        j->waited = true;
+                        ++it;
+                        continue;
+                    }
                     if ((seqs & (1ull << j->seq)) || (!pass.empty() && n_tokens + (int32_t) j->h.n_tokens > part->n_batch)) {
                         ++it;
                         continue;
