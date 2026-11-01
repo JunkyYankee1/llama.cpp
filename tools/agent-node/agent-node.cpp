@@ -2451,6 +2451,8 @@ struct gen_opts {
     // (the evaluator holds them); checkpoints: positions of the prompt where the chain keeps its state for later requests
     int32_t  n_cached    = 0;
     std::vector<int32_t> checkpoints;
+    // the same places for the draft model on this PC (it keeps its own states, also before n_cached)
+    std::vector<int32_t> marks;
 };
 
 // the next token from the top-k of one position (sorted by logit): greedy, or sampled with the temperature and top-p.
@@ -2526,6 +2528,7 @@ struct gen_result {
     std::vector<llama_token> tokens;
     int32_t n_prompt   = 0;
     int32_t n_cached   = 0; // of them, in the memory of the chain already (gen_opts::n_cached)
+    int32_t n_draft_cached = 0; // in the memory of the draft model already
     double  prefill_ms = 0;
     double  gen_ms     = 0;
     int32_t n_gen_eval = 0; // tokens produced in gen_ms (after the first one, which comes with the prompt)
@@ -2636,6 +2639,15 @@ struct draft_model {
     std::vector<uint8_t> ckpt;
     std::vector<top_entry> top1 = std::vector<top_entry>(1);
 
+    // the prompt of the last request (its tokens decoded in the prefill) and the states saved inside it, as the chain
+    // keeps them (gen_opts::checkpoints): the next request of the conversation starts at the longest shared one
+    std::vector<llama_token> seen;
+    struct mark {
+        int32_t              pos;
+        std::vector<uint8_t> data;
+    };
+    std::vector<mark> marks;
+
     draft_model(const model_opts & mo, uint32_t n_ctx, int32_t n_threads) {
         model   = load_model(mo);
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
@@ -2656,6 +2668,43 @@ struct draft_model {
     // a new text: forget the previous one (the local API serves many requests with one draft model)
     void reset() {
         llama_memory_clear(llama_get_memory(ctx.get()), true);
+        seen.clear();
+        marks.clear();
+    }
+
+    // a new prompt: back to the longest mark inside the start it shares with the last prompt; returns the position
+    // the prefill continues at (0: from the start)
+    int32_t start(const std::vector<llama_token> & prompt) {
+        size_t common = 0;
+        while (common < seen.size() && common < prompt.size() && seen[common] == prompt[common]) {
+            common++;
+        }
+        marks.erase(std::remove_if(marks.begin(), marks.end(), [&](const mark & m) { return (size_t) m.pos > common; }), marks.end());
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        for (auto it = marks.rbegin(); it != marks.rend(); ++it) {
+            if ((size_t) it->pos + 1 < prompt.size() &&
+                    llama_state_seq_set_data_ext(ctx.get(), it->data.data(), it->data.size(), 0, fl) == it->data.size() &&
+                    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, it->pos, -1)) {
+                const int32_t pos = it->pos;
+                seen.resize(pos);
+                return pos;
+            }
+        }
+        reset();
+        return 0;
+    }
+
+    // the tokens before pos are decoded: keep the state there (the 4 latest)
+    void keep(int32_t pos) {
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        marks.erase(std::remove_if(marks.begin(), marks.end(), [&](const mark & m) { return m.pos == pos; }), marks.end());
+        if (marks.size() >= 4) {
+            marks.erase(marks.begin());
+        }
+        mark m{ pos, std::vector<uint8_t>(llama_state_seq_get_size_ext(ctx.get(), 0, fl)) };
+        if (llama_state_seq_get_data_ext(ctx.get(), m.data.data(), m.data.size(), 0, fl) == m.data.size()) {
+            marks.push_back(std::move(m));
+        }
     }
 
     // decodes n tokens from pos0, returns the greedy next token
@@ -2713,18 +2762,30 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     }
 
     gen_result res;
-    dm.reset();
 
     double t0 = now_ms();
     std::vector<top_entry> top = prefill(ev, prompt, g, res);
     res.prefill_ms = now_ms() - t0;
 
-    // the draft model reads the prompt too, except its last token: every round starts by decoding the last token
+    // the draft model reads the prompt too, except its last token: every round starts by decoding the last token.
+    // A conversation that goes on starts at a mark of the last request (the places the chain keeps its state at)
     t0 = now_ms();
-    for (size_t i = 0; i + 1 < prompt.size(); i += g.n_batch) {
-        const uint32_t n = (uint32_t) std::min<size_t>(g.n_batch, prompt.size() - 1 - i);
-        dm.decode(prompt.data() + i, n, (int32_t) i);
+    const size_t n_read = prompt.size() - 1;
+    res.n_draft_cached = dm.start(prompt);
+    for (size_t i = (size_t) res.n_draft_cached; i < n_read;) {
+        size_t end = std::min(n_read, i + (size_t) g.n_batch);
+        for (int32_t m : g.marks) {
+            if (m > (int32_t) i && (size_t) m < end) {
+                end = (size_t) m;
+            }
+        }
+        dm.decode(prompt.data() + i, (uint32_t) (end - i), (int32_t) i);
+        if (std::find(g.marks.begin(), g.marks.end(), (int32_t) end) != g.marks.end()) {
+            dm.keep((int32_t) end);
+        }
+        i = end;
     }
+    dm.seen.assign(prompt.begin(), prompt.begin() + (ptrdiff_t) n_read);
     res.draft_ms += now_ms() - t0;
 
     if (before_gen) {
@@ -3320,6 +3381,9 @@ static int cmd_serve(const cli_args & a) {
                 if (p > n_cached && st->keep_s > 0) {
                     g.checkpoints.push_back(p);
                 }
+                if (p > 0) {
+                    g.marks.push_back(p);
+                }
             }
             g.n_gen       = max_tokens;
             g.n_ctx       = st->n_ctx;
@@ -3409,9 +3473,9 @@ static int cmd_serve(const cli_args & a) {
                       { "prompt_tokens_details", { { "cached_tokens", r.n_cached } } } };
             usage["agent"] = { { "session", c.session_hex }, { "points", charged }, { "balance", balance },
                                { "tok_s", r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0 }, { "nodes", c.nodes.size() } };
-            AN_LOG("serve: %d + %zu tokens (%d of the prompt kept in the chain), %.2f tok/s, %zu tool calls, %lld points (balance %lld)\n",
-                r.n_prompt, r.tokens.size(), r.n_cached, r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0,
-                final_msg.tool_calls.size(), charged, balance);
+            AN_LOG("serve: %d + %zu tokens (%d of the prompt kept in the chain%s), %.2f tok/s, %zu tool calls, %lld points (balance %lld)\n",
+                r.n_prompt, r.tokens.size(), r.n_cached, st->dm ? (", " + std::to_string(r.n_draft_cached) + " in the draft model").c_str() : "",
+                r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0, final_msg.tool_calls.size(), charged, balance);
         };
 
         if (!stream) {
