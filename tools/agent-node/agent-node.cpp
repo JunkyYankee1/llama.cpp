@@ -179,6 +179,10 @@ struct model_opts {
     // with cpu_moe: the experts of the last layers of the part stay on the GPU (the free video memory holds them;
     // a layer with its experts on the CPU runs 4 times slower, docs/Параллельные сессии.md)
     int32_t     gpu_expert_layers = 0;
+    // with cpu_moe: a cache on the GPU for the experts in RAM (llama.cpp, per context): of the 256 experts of a layer
+    // 8 work per token and the same ones are needed often, the cache keeps them. On an RTX 5060 Ti with 3 GB of cache
+    // 4 sessions get 2.3 times the tokens per second of all experts on the CPU, 10 layers of experts on the GPU 1.4 times
+    uint64_t    moe_cache_bytes = 0;
 };
 
 // the number of layers from the metadata of a GGUF file, without loading it
@@ -259,6 +263,7 @@ static model_opts model_opts_from(const cli_args & a) {
     mo.device       = a.get("--device", "-dev", "");
     mo.cpu_moe      = a.has("--cpu-moe");
     mo.gpu_expert_layers = a.get_int("--gpu-experts", "", 0);
+    mo.moe_cache_bytes   = mo.cpu_moe ? (uint64_t) a.get_int("--moe-cache-mib", "", 0) << 20 : 0;
     const std::string layers = a.get("--layers", "", "");
     if (!layers.empty()) {
         const size_t p = layers.find(':');
@@ -341,7 +346,7 @@ struct model_part {
     // n_seq > 1: one context for several sequences, n_ctx tokens shared by them all (a unified cache: llama.cpp puts
     // sequences with separate caches into one pass only when their ids follow one another, and sessions end in any order)
     model_part(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_rollback = 0,
-            uint32_t n_seq = 1) : model(model), n_seq(n_seq), n_rollback(n_rollback), n_past(n_seq, 0), ckpts(n_seq) {
+            uint32_t n_seq = 1, uint64_t moe_cache = 0) : model(model), n_seq(n_seq), n_rollback(n_rollback), n_past(n_seq, 0), ckpts(n_seq) {
         if (n_seq == 0 || n_seq > 64) {
             throw std::runtime_error("1..64 sequences in a context");
         }
@@ -362,6 +367,7 @@ struct model_part {
         cp.n_threads       = n_threads;
         cp.n_threads_batch = n_threads;
         cp.no_perf         = true;
+        cp.moe_cache_size  = (size_t) moe_cache;
         if (!is_last()) {
             cp.embeddings   = true;
             cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -1196,11 +1202,11 @@ static std::unique_ptr<model_part> make_node_part(const llama_model * model, con
         const int64_t f0 = free_mem();
         int64_t f1, f2;
         {
-            model_part p(model, mo, n_ctx, n_threads, n_rollback, 1);
+            model_part p(model, mo, n_ctx, n_threads, n_rollback, 1, mo.moe_cache_bytes);
             f1 = free_mem();
         }
         {
-            model_part p(model, mo, 2 * n_ctx, n_threads, n_rollback, 2);
+            model_part p(model, mo, 2 * n_ctx, n_threads, n_rollback, 2, mo.moe_cache_bytes);
             f2 = free_mem();
         }
         const int64_t per  = std::max<int64_t>(f1 - f2, 1);
@@ -1209,7 +1215,7 @@ static std::unique_ptr<model_part> make_node_part(const llama_model * model, con
         AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the context %.0f MiB more: %u of %u sessions fit with %.0f MiB to spare\n",
             f0 / 1048576.0, per / 1048576.0, std::max<int64_t>(base, 0) / 1048576.0, n, want, margin / 1048576.0);
     }
-    return std::make_unique<model_part>(model, mo, n * n_ctx, n_threads, n_rollback, n);
+    return std::make_unique<model_part>(model, mo, n * n_ctx, n_threads, n_rollback, n, mo.moe_cache_bytes);
 }
 
 //
@@ -1460,24 +1466,33 @@ static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, cons
         }
         // the video memory left after the rest of the slice takes the experts of the last layers, with the same
         // headroom the coordinator keeps (10%, at least 512 MB: compute buffers grow, other programs share the GPU)
+        // by default the room goes to the expert cache (--moe-cache-mib to set it), --gpu-experts N: the experts of N layers
         mo.gpu_expert_layers = 0;
+        mo.moe_cache_bytes   = 0;
+        const uint64_t headroom = std::max<uint64_t>(vram / 10, 512ull << 20);
+        const uint64_t room = vram > bytes + headroom ? vram - bytes - headroom : 0;
+        uint64_t gpu_experts = 0;
         if (a.has("--gpu-experts")) {
             mo.gpu_expert_layers = std::clamp(a.get_int("--gpu-experts", "", 0), 0, last - first);
-        } else {
-            const uint64_t headroom = std::max<uint64_t>(vram / 10, 512ull << 20);
-            uint64_t room = vram > bytes + headroom ? vram - bytes - headroom : 0;
-            for (int32_t l = last; l-- > first && ms.expert_bytes[l] <= room;) {
-                room -= ms.expert_bytes[l];
-                mo.gpu_expert_layers++;
+            for (int32_t l = last - mo.gpu_expert_layers; l < last; l++) {
+                gpu_experts += ms.expert_bytes[l];
             }
-        }
-        uint64_t gpu_experts = 0;
-        for (int32_t l = last - mo.gpu_expert_layers; l < last; l++) {
-            gpu_experts += ms.expert_bytes[l];
+            AN_LOG("node: the experts of %d of %d layers on the GPU (%s), the rest in RAM\n", mo.gpu_expert_layers, last - first,
+                fmt_gb(gpu_experts).c_str());
+        } else {
+            uint64_t all = 0;
+            for (int32_t l = first; l < last; l++) {
+                all += ms.expert_bytes[l];
+            }
+            // more than all experts of the slice is of no use; less than one layer of them neither
+            mo.moe_cache_bytes = a.has("--moe-cache-mib") ? (uint64_t) a.get_int("--moe-cache-mib", "", 0) << 20 : std::min(room, all);
+            if (mo.moe_cache_bytes < (64ull << 20)) {
+                mo.moe_cache_bytes = 0;
+            }
+            gpu_experts = mo.moe_cache_bytes;
+            AN_LOG("node: the experts in RAM (%s), a cache of %s of them on the GPU\n", fmt_gb(all).c_str(), fmt_gb(gpu_experts).c_str());
         }
         bytes += gpu_experts;
-        AN_LOG("node: the experts of %d of %d layers on the GPU (%s), the rest in RAM\n", mo.gpu_expert_layers, last - first,
-            fmt_gb(gpu_experts).c_str());
     }
     return bytes;
 }
@@ -1908,6 +1923,7 @@ static int cmd_node(const cli_args & a) {
             { "forwards", srv.n_forwards.load() },
             { "shared", srv.n_shared.load() },
             { "gpu_expert_layers", srv.mo.cpu_moe ? srv.mo.gpu_expert_layers : -1 },
+            { "moe_cache_mb", (long long) (srv.mo.moe_cache_bytes >> 20) },
             { "vram_full", v.over() > 0 },
         };
         if (v.free >= 0) {
@@ -4538,8 +4554,9 @@ static void usage() {
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "                  [--relay off|auto|only]  behind NAT: reachable through the relay of the network\n"
         "                  [--p2p on|off]  behind NAT: direct UDP connections through the rendezvous server first (on)\n"
-        "      node|verify [--cpu-moe [--ram-gb N] [--gpu-experts N]]  the experts of an MoE model in RAM, the rest on the GPU;\n"
-        "                  the experts of the last N layers on the GPU too (with --model-url: as many as the free memory holds)\n"
+        "      node|verify [--cpu-moe [--ram-gb N] [--moe-cache-mib M | --gpu-experts N]]  the experts of an MoE model in RAM,\n"
+        "                  the rest on the GPU; a cache of M MB of them on the GPU (with --model-url: what the free memory holds),\n"
+        "                  or the experts of the last N layers on the GPU\n"
         "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
         "                  instead of -m and --layers: the coordinator assigns the layers, the node downloads only them\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
