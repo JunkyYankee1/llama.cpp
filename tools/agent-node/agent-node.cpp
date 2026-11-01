@@ -110,7 +110,7 @@ struct cli_args {
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
-            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max",
+            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -289,13 +289,21 @@ struct model_part {
     int32_t  n_batch = 512;
     uint32_t n_seq = 1, n_rollback = 0;
     std::vector<int32_t> n_past; // tokens of each sequence in the memory: its next forward continues at this position
+
+    // saved states of a sequence (FORWARD_CHECKPOINT): the recurrent layers at a position; the KV cache before it stays
+    struct checkpoint {
+        int32_t              pos = 0;
+        std::vector<uint8_t> data;
+    };
+    static constexpr size_t max_checkpoints = 4; // per sequence, the oldest goes first (the client counts the same way)
+    std::vector<std::vector<checkpoint>> ckpts;
     double   last_output_ms = 0; // time of reading the outputs in the last pass
 
     // n_rollback: how many trailing tokens of a forward can be rolled back (speculative decoding)
     // n_seq > 1: one context for several sequences, n_ctx tokens shared by them all (a unified cache: llama.cpp puts
     // sequences with separate caches into one pass only when their ids follow one another, and sessions end in any order)
     model_part(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_rollback = 0,
-            uint32_t n_seq = 1) : model(model), n_seq(n_seq), n_rollback(n_rollback), n_past(n_seq, 0) {
+            uint32_t n_seq = 1) : model(model), n_seq(n_seq), n_rollback(n_rollback), n_past(n_seq, 0), ckpts(n_seq) {
         if (n_seq == 0 || n_seq > 64) {
             throw std::runtime_error("1..64 sequences in a context");
         }
@@ -333,6 +341,7 @@ struct model_part {
     void clear(llama_seq_id seq) {
         llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, -1, -1);
         n_past[seq] = 0;
+        ckpts[seq].clear();
     }
 
     // runs the tokens or the hidden states of one forward frame of sequence 0
@@ -382,6 +391,13 @@ struct model_part {
         for (part_job * j : run) {
             n_past[j->seq] = j->h.pos0 + (int32_t) j->h.n_tokens;
             j->n_pass = (uint32_t) run.size();
+            if (j->h.flags & FORWARD_CHECKPOINT) {
+                try {
+                    save_checkpoint(j->seq);
+                } catch (const std::exception & e) {
+                    j->err = e.what();
+                }
+            }
             try {
                 read(*j);
             } catch (const std::exception & e) {
@@ -396,6 +412,42 @@ struct model_part {
     }
 
 private:
+    void save_checkpoint(llama_seq_id seq) {
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        auto & cs = ckpts[seq];
+        cs.erase(std::remove_if(cs.begin(), cs.end(), [&](const checkpoint & c) { return c.pos == n_past[seq]; }), cs.end());
+        if (cs.size() >= max_checkpoints) {
+            cs.erase(cs.begin());
+        }
+        checkpoint c;
+        c.pos = n_past[seq];
+        c.data.resize(llama_state_seq_get_size_ext(ctx.get(), seq, fl));
+        if (llama_state_seq_get_data_ext(ctx.get(), c.data.data(), c.data.size(), seq, fl) != c.data.size()) {
+            throw std::runtime_error("cannot save the state of the session");
+        }
+        cs.push_back(std::move(c));
+    }
+
+    // the next forward of seq starts at pos, before the end: the rejected draft tokens (the rollback snapshots of the
+    // recurrent layers cover the last n_rollback tokens) or the start of a new request at a checkpoint
+    void roll_back(llama_seq_id seq, int32_t pos) {
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        int32_t & past = n_past[seq];
+        auto & cs = ckpts[seq];
+        // the states after pos belong to the text that is dropped now
+        cs.erase(std::remove_if(cs.begin(), cs.end(), [&](const checkpoint & c) { return c.pos > pos; }), cs.end());
+        if (!llama_memory_seq_rm(mem, seq, pos, -1)) {
+            auto it = std::find_if(cs.begin(), cs.end(), [&](const checkpoint & c) { return c.pos == pos; });
+            const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            if (it == cs.end() || llama_state_seq_set_data_ext(ctx.get(), it->data.data(), it->data.size(), seq, fl) != it->data.size() ||
+                    !llama_memory_seq_rm(mem, seq, pos, -1)) {
+                throw std::runtime_error("cannot roll back from " + std::to_string(past) + " to " + std::to_string(pos) +
+                    " (at most n_rollback tokens of the last forward, or to a checkpoint)");
+            }
+        }
+        past = pos;
+    }
+
     void add(part_job & j, common_batch & batch, uint64_t & seqs) {
         const forward_hdr & h = j.h;
         if (j.seq < 0 || (uint32_t) j.seq >= n_seq) {
@@ -429,11 +481,7 @@ private:
             throw std::runtime_error("forward at position " + std::to_string(h.pos0) + " leaves a gap after " + std::to_string(past));
         }
         if (h.pos0 < past) {
-            if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), j.seq, h.pos0, -1)) {
-                throw std::runtime_error("cannot roll back from " + std::to_string(past) + " to " + std::to_string(h.pos0) +
-                    " (at most n_rollback tokens of the last forward)");
-            }
-            past = h.pos0;
+            roll_back(j.seq, h.pos0);
         }
 
         seqs |= 1ull << j.seq;
@@ -1912,8 +1960,10 @@ static int cmd_node(const cli_args & a) {
 
 struct evaluator {
     virtual ~evaluator() = default;
-    // runs n tokens from position pos0, returns the top-k of the last token, or of every token with out_all
-    virtual std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) = 0;
+    // runs n tokens from position pos0, returns the top-k of the last token, or of every token with out_all;
+    // checkpoint: keep the state after these tokens, a later eval may start there again (only the chain needs it)
+    virtual std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false,
+            bool checkpoint = false) = 0;
 };
 
 struct chain_opts {
@@ -1967,6 +2017,7 @@ struct chain_eval : evaluator {
     uint32_t                      step = 0;
     uint32_t                      n_top = 8;
     std::vector<llama_token>      hist;  // the tokens in the memory of the chain, by position
+    std::vector<int32_t>          ckpts; // positions the nodes keep a state at (FORWARD_CHECKPOINT), the oldest first
     std::shared_ptr<chain_events> ev = std::make_shared<chain_events>();
     uint64_t                      gen = 0; // connections of older generations are ignored
     void *                        cctx = nullptr;
@@ -2148,10 +2199,12 @@ struct chain_eval : evaluator {
         }
     }
 
-    std::vector<top_entry> eval_once(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all) {
+    std::vector<top_entry> eval_once(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all, bool checkpoint = false) {
         if ((size_t) pos0 > hist.size()) {
             throw std::runtime_error("forward leaves a gap in the context");
         }
+        // as the nodes do (model_part::roll_back): the states after pos0 belong to the dropped text
+        ckpts.erase(std::remove_if(ckpts.begin(), ckpts.end(), [&](int32_t p) { return p > pos0; }), ckpts.end());
         hist.resize(pos0);
         hist.insert(hist.end(), tokens, tokens + n);
 
@@ -2161,7 +2214,7 @@ struct chain_eval : evaluator {
         h.pos0     = pos0;
         h.n_tokens = n;
         h.kind     = payload::tokens;
-        h.flags    = out_all ? FORWARD_OUT_ALL : 0;
+        h.flags    = (out_all ? FORWARD_OUT_ALL : 0) | (checkpoint ? FORWARD_CHECKPOINT : 0);
         writer w;
         h.write(w);
         w.put_bytes(tokens, (size_t) n * sizeof(llama_token));
@@ -2175,16 +2228,25 @@ struct chain_eval : evaluator {
         if (res.step != step || res.n_out != (out_all ? n : 1)) {
             throw std::runtime_error("result for step " + std::to_string(res.step) + ", expected " + std::to_string(step));
         }
+        if (checkpoint) {
+            const int32_t p = pos0 + (int32_t) n;
+            ckpts.erase(std::remove(ckpts.begin(), ckpts.end(), p), ckpts.end());
+            if (ckpts.size() >= model_part::max_checkpoints) {
+                ckpts.erase(ckpts.begin());
+            }
+            ckpts.push_back(p);
+        }
         if (out_all) {
             return res.top;
         }
         return std::vector<top_entry>(res.top.end() - res.n_top, res.top.end());
     }
 
-    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) override {
+    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false,
+            bool checkpoint = false) override {
         while (true) {
             try {
-                return eval_once(tokens, n, pos0, out_all);
+                return eval_once(tokens, n, pos0, out_all, checkpoint);
             } catch (const chain_failure & e) {
                 if (n_recoveries >= o.max_recoveries) {
                     throw std::runtime_error(std::string("the chain failed again: ") + e.what());
@@ -2275,6 +2337,7 @@ struct chain_eval : evaluator {
         // the new nodes read the context again; a failure here is handled by the caller's next attempt
         const std::vector<llama_token> pre(hist.begin(), hist.begin() + std::min<size_t>(pos0, hist.size()));
         hist.clear();
+        ckpts.clear(); // the new nodes keep no states yet
         for (size_t i = 0; i < pre.size(); i += 512) {
             const uint32_t n = (uint32_t) std::min<size_t>(512, pre.size() - i);
             eval_once(pre.data() + i, n, (int32_t) i, false);
@@ -2283,6 +2346,22 @@ struct chain_eval : evaluator {
         recover_ms    += dt;
         recover_max_ms = std::max(recover_max_ms, dt);
         AN_LOG("chain recovered in %.0f ms, %zu tokens of context read again\n", dt, pre.size());
+    }
+
+    // how many first tokens of a new prompt can stay in the memory of the chain: up to the longest common start, where
+    // the nodes can go on (the end of the memory, or a checkpoint); at least one token of the prompt is left to read
+    int32_t reusable(const std::vector<llama_token> & prompt) const {
+        size_t common = 0;
+        while (common < hist.size() && common < prompt.size() && hist[common] == prompt[common]) {
+            common++;
+        }
+        int32_t best = common == hist.size() && common < prompt.size() ? (int32_t) common : 0;
+        for (int32_t c : ckpts) {
+            if (c <= (int32_t) common && (size_t) c < prompt.size()) {
+                best = std::max(best, c);
+            }
+        }
+        return best;
     }
 
     std::vector<stats_msg> stats() {
@@ -2306,7 +2385,7 @@ struct local_eval : evaluator {
     local_eval(const llama_model * model, const model_opts & mo, uint32_t n_ctx, int32_t n_threads, uint32_t n_top)
         : part(model, mo, n_ctx, n_threads), n_top(n_top) {}
 
-    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false) override {
+    std::vector<top_entry> eval(const llama_token * tokens, uint32_t n, int32_t pos0, bool out_all = false, bool = false) override {
         forward_hdr h;
         h.pos0     = pos0;
         h.n_tokens = n;
@@ -2368,6 +2447,10 @@ struct gen_opts {
     float    temperature = 0.0f;
     float    top_p       = 1.0f;
     uint32_t seed        = 0;
+    // a conversation that continues: the first n_cached tokens of the prompt are in the memory of the chain already
+    // (the evaluator holds them); checkpoints: positions of the prompt where the chain keeps its state for later requests
+    int32_t  n_cached    = 0;
+    std::vector<int32_t> checkpoints;
 };
 
 // the next token from the top-k of one position (sorted by logit): greedy, or sampled with the temperature and top-p.
@@ -2442,6 +2525,7 @@ static std::vector<llama_token> make_prompt(const llama_vocab * vocab, const lla
 struct gen_result {
     std::vector<llama_token> tokens;
     int32_t n_prompt   = 0;
+    int32_t n_cached   = 0; // of them, in the memory of the chain already (gen_opts::n_cached)
     double  prefill_ms = 0;
     double  gen_ms     = 0;
     int32_t n_gen_eval = 0; // tokens produced in gen_ms (after the first one, which comes with the prompt)
@@ -2452,6 +2536,29 @@ struct gen_result {
     double  draft_ms   = 0; // time of the draft model on the client
     double  verify_ms  = 0; // time of the passes over the chain that check the drafts
 };
+
+// reads the prompt after the n_cached tokens the chain has, in batches; a batch that ends at one of g.checkpoints keeps
+// the state of the chain there. Returns the top-k after the last token
+static std::vector<top_entry> prefill(evaluator & ev, const std::vector<llama_token> & prompt, const gen_opts & g, gen_result & res) {
+    if (g.n_cached < 0 || (size_t) g.n_cached >= prompt.size()) {
+        throw std::runtime_error("the cached part of the prompt must leave at least one token to read");
+    }
+    res.n_prompt = (int32_t) prompt.size();
+    res.n_cached = g.n_cached;
+    std::vector<top_entry> top;
+    for (size_t i = (size_t) g.n_cached; i < prompt.size();) {
+        size_t end = std::min(prompt.size(), i + (size_t) g.n_batch);
+        for (int32_t c : g.checkpoints) {
+            if (c > (int32_t) i && (size_t) c < end) {
+                end = (size_t) c;
+            }
+        }
+        const bool keep = std::find(g.checkpoints.begin(), g.checkpoints.end(), (int32_t) end) != g.checkpoints.end();
+        top = ev.eval(prompt.data() + i, (uint32_t) (end - i), (int32_t) i, false, keep);
+        i = end;
+    }
+    return top;
+}
 
 // before_gen is called after the prompt, when the timed generation starts
 static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std::vector<llama_token> & prompt, const gen_opts & g,
@@ -2469,15 +2576,10 @@ static gen_result generate(evaluator & ev, const llama_vocab * vocab, const std:
     }
 
     gen_result res;
-    res.n_prompt = (int32_t) prompt.size();
     std::mt19937 rng(g.seed);
 
     double t0 = now_ms();
-    std::vector<top_entry> top;
-    for (size_t i = 0; i < prompt.size(); i += g.n_batch) {
-        const uint32_t n = (uint32_t) std::min<size_t>(g.n_batch, prompt.size() - i);
-        top = ev.eval(prompt.data() + i, n, (int32_t) i);
-    }
+    std::vector<top_entry> top = prefill(ev, prompt, g, res);
     res.prefill_ms = now_ms() - t0;
 
     if (before_gen) {
@@ -2611,15 +2713,10 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     }
 
     gen_result res;
-    res.n_prompt = (int32_t) prompt.size();
     dm.reset();
 
     double t0 = now_ms();
-    std::vector<top_entry> top;
-    for (size_t i = 0; i < prompt.size(); i += g.n_batch) {
-        const uint32_t n = (uint32_t) std::min<size_t>(g.n_batch, prompt.size() - i);
-        top = ev.eval(prompt.data() + i, n, (int32_t) i);
-    }
+    std::vector<top_entry> top = prefill(ev, prompt, g, res);
     res.prefill_ms = now_ms() - t0;
 
     // the draft model reads the prompt too, except its last token: every round starts by decoding the last token
@@ -2966,6 +3063,17 @@ struct serve_state {
     uint32_t                     n_ctx   = 8192;
     int                          spares  = 1;
     std::string                  city;
+
+    // the chain of the last request stays open: the next request of the conversation (a step of the agent) starts
+    // at the checkpoint before the answer instead of reading the whole conversation again (--keep-chain-s, 0: off).
+    // A session lives at most 8 minutes: the coordinator settles the sessions opened more than 10 minutes ago,
+    // later reports of a settled session would not be charged
+    std::unique_ptr<chain_eval>  chain;
+    coord_chain                  chain_info;
+    double                       chain_opened = 0, chain_used = 0;
+    int                          keep_s = 180;
+    static constexpr int         max_age_s = 480;
+    int64_t                      billed_prompt = 0, billed_gen = 0; // of the session, for the report (a running total)
 };
 
 static json to_nl(const common_json & j) {
@@ -3002,6 +3110,7 @@ static int cmd_serve(const cli_args & a) {
     st->spares  = a.get_int("--spares", "", 1);
     st->city    = a.get("--city", "", "");
     st->n_draft = a.get_int("--draft-max", "", 6);
+    st->keep_s  = a.get_int("--keep-chain-s", "", 180);
     st->acc     = account_from(a);
     if (a.has("--draft")) {
         model_opts dmo;
@@ -3084,6 +3193,9 @@ static int cmd_serve(const cli_args & a) {
         auto inputs = std::make_shared<common_chat_templates_inputs>();
         std::shared_ptr<common_chat_session> cs;
         std::vector<llama_token> prompt;
+        // where the conversation ends and the answer starts, and where the system message (instructions, tools) ends:
+        // the chain keeps its state there, for the next step of the agent and for a new conversation
+        int32_t boundary = 0, sys_end = 0;
         try {
             inputs->messages = common_chat_msgs_parse_oaicompat(common_json::parse(body["messages"].dump()));
             if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
@@ -3096,12 +3208,51 @@ static int cmd_serve(const cli_args & a) {
             inputs->enable_thinking  = body.value("think", true);
             inputs->reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
             cs = std::make_shared<common_chat_session>(st->tmpls.get(), st->vocab, *inputs);
-            bool first = true;
-            for (const auto & part : cs->prompt().parts) {
-                // text of the user is not parsed for special tokens: a message cannot forge a turn of the template
-                const auto t = common_tokenize(st->vocab, part.text, first, !part.is_input);
-                prompt.insert(prompt.end(), t.begin(), t.end());
-                first = false;
+            auto tokenize = [&](const common_chat_prompt & pr) {
+                std::vector<llama_token> out;
+                bool first = true;
+                for (const auto & part : pr.parts) {
+                    // text of the user is not parsed for special tokens: a message cannot forge a turn of the template
+                    const auto t = common_tokenize(st->vocab, part.text, first, !part.is_input);
+                    out.insert(out.end(), t.begin(), t.end());
+                    first = false;
+                }
+                return out;
+            };
+            prompt = tokenize(cs->prompt());
+            // the same conversation without the start of the answer: the next request renders this answer as a message,
+            // with the text after it; what both share is the part the next request can keep
+            common_chat_templates_inputs past = *inputs;
+            past.add_generation_prompt = false;
+            const std::vector<llama_token> before = tokenize(common_chat_templates_apply(st->tmpls.get(), past).prompt);
+            auto common = [&](const std::vector<llama_token> & x) {
+                size_t n = 0;
+                while (n < x.size() && n < prompt.size() && x[n] == prompt[n]) {
+                    n++;
+                }
+                return (int32_t) n;
+            };
+            boundary = common(before);
+            common_chat_templates_inputs sys = past;
+            sys.messages.clear();
+            for (const auto & m : inputs->messages) {
+                if (m.role != "system") {
+                    break;
+                }
+                sys.messages.push_back(m);
+            }
+            if (!sys.messages.empty() && sys.messages.size() < inputs->messages.size()) {
+                try {
+                    sys_end = common(tokenize(common_chat_templates_apply(st->tmpls.get(), sys).prompt));
+                } catch (const std::exception &) {
+                    // a template that needs a user message (Qwen3.5): the system message ends where the first user turn starts
+                    common_chat_templates_inputs one = sys;
+                    common_chat_msg u;
+                    u.role    = "user";
+                    u.content = "\x01";
+                    one.messages.push_back(u);
+                    sys_end = common(tokenize(common_chat_templates_apply(st->tmpls.get(), one).prompt));
+                }
             }
         } catch (const std::exception & e) {
             return fail(400, std::string("bad chat: ") + e.what());
@@ -3123,27 +3274,56 @@ static int cmd_serve(const cli_args & a) {
 
         // runs the request; out(delta) gets OpenAI deltas (reasoning_content, content, tool_calls), false: stop.
         // final: the whole message
-        auto run = [st, hidden, prompt, max_tokens, temperature, top_p, seed, cs](
+        auto run = [st, hidden, prompt, boundary, sys_end, max_tokens, temperature, top_p, seed, cs](
                        const std::function<bool(const json &)> & out, json & usage, std::string & finish, common_chat_msg & final_msg) {
             std::lock_guard<std::mutex> lock(st->mtx);
-            const coord_chain c = request_chain(st->acc, st->key, st->spares, 3600, st->city);
-            chain_opts co;
-            co.nodes      = c.nodes;
-            co.spares     = c.spares;
-            co.session    = c.session;
-            co.tls        = true;
-            co.n_ctx      = st->n_ctx;
-            co.n_top      = 16; // the candidates for sampling
-            co.hidden     = hidden;
-            co.n_rollback = st->dm ? (uint32_t) st->n_draft : 0;
-            chain_eval chain(co);
-            if (chain.parts[0].n_vocab != llama_vocab_n_tokens(st->vocab)) {
-                throw std::runtime_error("the tokenizer does not match the model of the chain");
+            const double t_start = now_ms();
+            if (st->chain && (t_start - st->chain_used > st->keep_s * 1000.0 || t_start - st->chain_opened > st->max_age_s * 1000.0)) {
+                st->chain.reset();
             }
+            int32_t n_cached = st->chain ? st->chain->reusable(prompt) : 0;
+            if (!st->chain) {
+                st->chain_info = request_chain(st->acc, st->key, st->spares, 3600, st->city);
+                chain_opts co;
+                co.nodes      = st->chain_info.nodes;
+                co.spares     = st->chain_info.spares;
+                co.session    = st->chain_info.session;
+                co.tls        = true;
+                co.n_ctx      = st->n_ctx;
+                co.n_top      = 16; // the candidates for sampling
+                co.hidden     = hidden;
+                co.n_rollback = st->dm ? (uint32_t) st->n_draft : 0;
+                st->chain = std::make_unique<chain_eval>(co);
+                st->chain_opened  = t_start;
+                st->billed_prompt = st->billed_gen = 0;
+                n_cached = 0;
+                if (st->chain->parts[0].n_vocab != llama_vocab_n_tokens(st->vocab)) {
+                    st->chain.reset();
+                    throw std::runtime_error("the tokenizer does not match the model of the chain");
+                }
+            }
+            chain_eval & chain = *st->chain;
+            const coord_chain & c = st->chain_info;
+            // a failed request leaves the chain in an unknown state: the next one opens a new chain
+            struct drop_on_error {
+                serve_state & st;
+                bool ok = false;
+                ~drop_on_error() {
+                    if (!ok) {
+                        st.chain.reset();
+                    }
+                }
+            } guard{ *st };
             gen_opts g;
+            g.n_cached    = n_cached;
+            for (int32_t p : { sys_end, boundary }) {
+                if (p > n_cached && st->keep_s > 0) {
+                    g.checkpoints.push_back(p);
+                }
+            }
             g.n_gen       = max_tokens;
             g.n_ctx       = st->n_ctx;
-            g.n_top       = co.n_top;
+            g.n_top       = chain.n_top;
             g.hidden      = hidden;
             g.temperature = temperature;
             g.top_p       = top_p;
@@ -3213,15 +3393,25 @@ static int cmd_serve(const cli_args & a) {
             if (!stopped) {
                 emit(final_msg);
             }
+            // the nodes read only the tokens after the cached start: the report is a running total of the session
+            st->billed_prompt += r.n_prompt - r.n_cached;
+            st->billed_gen    += (int64_t) r.tokens.size();
             long long charged = 0;
-            const long long balance = report_session(st->acc, c.session_hex, r.n_prompt, (int32_t) r.tokens.size(), &charged);
+            const long long balance = report_session(st->acc, c.session_hex, (int32_t) st->billed_prompt, (int32_t) st->billed_gen, &charged);
+            guard.ok        = true;
+            st->chain_used  = now_ms();
+            if (st->keep_s <= 0) {
+                st->chain.reset();
+            }
             finish = !final_msg.tool_calls.empty() ? "tool_calls" : ended ? "stop" : "length";
             usage = { { "prompt_tokens", r.n_prompt }, { "completion_tokens", (int) r.tokens.size() },
-                      { "total_tokens", r.n_prompt + (int) r.tokens.size() } };
+                      { "total_tokens", r.n_prompt + (int) r.tokens.size() },
+                      { "prompt_tokens_details", { { "cached_tokens", r.n_cached } } } };
             usage["agent"] = { { "session", c.session_hex }, { "points", charged }, { "balance", balance },
                                { "tok_s", r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0 }, { "nodes", c.nodes.size() } };
-            AN_LOG("serve: %d + %zu tokens, %.2f tok/s, %zu tool calls, %lld points (balance %lld)\n", r.n_prompt, r.tokens.size(),
-                r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0, final_msg.tool_calls.size(), charged, balance);
+            AN_LOG("serve: %d + %zu tokens (%d of the prompt kept in the chain), %.2f tok/s, %zu tool calls, %lld points (balance %lld)\n",
+                r.n_prompt, r.tokens.size(), r.n_cached, r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0,
+                final_msg.tool_calls.size(), charged, balance);
         };
 
         if (!stream) {
@@ -4186,7 +4376,8 @@ static void usage() {
         "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]]   speculative decoding\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
         "  agent-node serve     -m model.gguf --coordinator URL [--port 8090] [--draft DRAFT.gguf] [-c 8192] [--account FILE]\n"
-        "                       the local API of the agent (OpenAI-style /v1/chat/completions, reasoning in reasoning_content)\n"
+        "                       [--keep-chain-s 180]  the local API of the agent (OpenAI-style /v1/chat/completions, reasoning in\n"
+        "                       reasoning_content); the chain stays open between requests, the next one reads only the new text\n"
         "  agent-node verify    -m whole-model.gguf --coordinator URL --verifier-token T [--every 60] [--listen-host H --listen-port 50190 --bind-host 0.0.0.0]\n"
         "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
