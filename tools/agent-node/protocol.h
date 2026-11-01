@@ -55,6 +55,10 @@ inline size_t payload_size(payload kind, uint32_t n_tokens, int32_t n_embd) {
 
 enum forward_flags : uint8_t {
     FORWARD_OUT_ALL = 1, // the last node returns logits for every token, not only the last one
+    // after this forward every node keeps the state of the session at its end (pos0 + n_tokens): a later forward may
+    // start there again, the tokens after it are dropped. The local API starts the next request of a conversation
+    // there instead of reading it all again (recurrent layers cannot roll back far without a saved state)
+    FORWARD_CHECKPOINT = 2,
 };
 
 class writer {

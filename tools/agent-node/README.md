@@ -75,6 +75,12 @@ a pass takes what came while the previous one ran.
   fewer sessions if they would not fit with `--vram-margin-mb 256` to spare; the coordinator gets the number in `max_sessions`.
 - `--batch-max N` forwards in a pass at most; `1` runs them one at a time (to compare).
 
+A forward with `FORWARD_CHECKPOINT` makes every node keep the state of the session after it (the recurrent layers;
+4 per session, the oldest goes first); a later forward may start at that position again. `serve` keeps the chain of
+the last request open (`--keep-chain-s 180`, a session at most 8 minutes) with checkpoints where the system message
+ends and where the conversation ends before the answer: the next step of the agent reads only the answer and the tool
+results, a new conversation only its first message. The coordinator takes the reports of a session as a running total.
+
 Every 30 s the node prints `agent-node: status {...}` (the app shows it) and sends the same in the heartbeat
 (`GET /v1/nodes` of the coordinator): sessions, `max_sessions`, forwards and those in shared passes, free video memory,
 and on Windows the shared memory of the node (`vram_shared_mb`, as in Task Manager). When the weights or the context
