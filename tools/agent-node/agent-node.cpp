@@ -110,7 +110,7 @@ struct cli_args {
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
-            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib",
+            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -4201,12 +4201,29 @@ static int cmd_bench_batch(const cli_args & a) {
     for (float & x : embd) {
         x = val(rng);
     }
+    // --text FILE: the first part reads text, every user a piece of its own, as people do; random tokens hit random
+    // experts, and the expert cache (--moe-cache-mib) would look worse than with people, repeated ones better
+    std::vector<llama_token> text;
+    if (a.has("--text")) {
+        if (!is_first) {
+            throw std::runtime_error("--text needs the first layers (a part from layer 0): later parts take hidden states");
+        }
+        text = common_tokenize(llama_model_get_vocab(model.get()), read_file(a.get("--text", "", "")), false, false);
+        if (text.size() < 1024) {
+            throw std::runtime_error("--text: the file has " + std::to_string(text.size()) + " tokens, at least 1024 are needed");
+        }
+        AN_LOG("bench-batch: inputs from %s, %zu tokens\n", a.get("--text", "", "").c_str(), text.size());
+    }
     common_batch batch(ctx.get());
     // the input of user u at position p: the same whatever the batch, so that --check can decode it alone
-    // (into sequence s) and get the same output
+    // (into sequence s) and get the same output. Every measured size takes new users: inputs seen before would stay
+    // in the expert cache
     auto add = [&](int u, llama_pos p, llama_seq_id s, bool out) {
         const uint32_t h = (uint32_t) u * 2654435761u ^ (uint32_t) p * 40503u;
-        if (is_first) {
+        if (!text.empty()) {
+            const size_t start = ((size_t) u * 2654435761u) % text.size();
+            batch.add(text[(start + (size_t) p) % text.size()], p, s, out);
+        } else if (is_first) {
             batch.add((llama_token) (h % (uint32_t) n_vocab), p, s, out);
         } else {
             const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
@@ -4220,14 +4237,14 @@ static int cmd_bench_batch(const cli_args & a) {
         llama_synchronize(ctx.get());
     };
 
-    // the history of users 0..n-1, user u into sequence u (or all into sequence seq when alone)
+    // the history of users u0..u0+n-1, user u0+i into sequence i (or into sequence 0 when alone)
     auto prefill = [&](int u0, int n, bool alone) {
         for (int u = u0; u < u0 + n; u++) {
             for (int p0 = 0; p0 < n_hist; p0 += 512) {
                 batch.clear();
                 const int m = std::min(512, n_hist - p0);
                 for (int i = 0; i < m; i++) {
-                    add(u, p0 + i, alone ? 0 : u, i + 1 == m);
+                    add(u, p0 + i, alone ? 0 : u - u0, i + 1 == m);
                 }
                 process();
             }
@@ -4247,14 +4264,15 @@ static int cmd_bench_batch(const cli_args & a) {
     json rows = json::array();
     double ms1 = 0;
     printf("%6s %12s %14s %10s\n", "seqs", "ms/step", "tokens/s", "vs 1");
+    int u0 = 0; // the first user of the measured size
     for (int n : seqs) {
         llama_memory_clear(llama_get_memory(ctx.get()), true);
-        prefill(0, n, false);
+        prefill(u0, n, false);
         double total = 0;
         for (int t = -2; t < n_steps; t++) { // two steps to warm up
             batch.clear();
             for (int s = 0; s < n; s++) {
-                add(s, n_hist + 2 + t, s, true);
+                add(u0 + s, n_hist + 2 + t, s, true);
             }
             const double t0 = now_ms();
             process();
@@ -4278,10 +4296,10 @@ static int cmd_bench_batch(const cli_args & a) {
             int top_same = 0;
             for (int u = 0; u < n; u++) {
                 llama_memory_clear(llama_get_memory(ctx.get()), true);
-                prefill(u, 1, true);
+                prefill(u0 + u, 1, true);
                 for (int t = -2; t < n_steps; t++) {
                     batch.clear();
-                    add(u, n_hist + 2 + t, 0, true);
+                    add(u0 + u, n_hist + 2 + t, 0, true);
                     process();
                 }
                 const std::vector<float> ref = output(0);
@@ -4301,10 +4319,11 @@ static int cmd_bench_batch(const cli_args & a) {
         }
         printf("%6d %12.2f %14.1f %9.2fx%s\n", n, ms, n * 1000.0 / ms, n * ms1 / ms, verdict.c_str());
         rows.push_back(row);
+        u0 += n;
     }
     const std::string out = a.get("--json", "", "");
     if (!out.empty()) {
-        std::ofstream(out) << json({ { "model", model_desc(model.get()) }, { "layer_start", first }, { "layer_end", last }, { "n_layer", n_layer },
+        std::ofstream(u8_path(out)) << json({ { "model", model_desc(model.get()) }, { "layer_start", first }, { "layer_end", last }, { "n_layer", n_layer },
                                      { "ctx_per_seq", n_hist }, { "steps", n_steps }, { "cpu_moe", mo.cpu_moe }, { "rows", rows } })
                                    .dump(1)
                                << "\n";
@@ -4518,7 +4537,7 @@ static void usage() {
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
         "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M]] [--seqs 1,2,4,8]\n"
-        "                       [-c 512] [-n 32] [--check] [--json F]\n"
+        "                       [-c 512] [-n 32] [--check] [--text FILE] [--json F]\n"
         "                       one decode step of the layers for several sequences at once: what batching sessions gives\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
         "                       only the weights of the range (downloaded by HTTP ranges), with the metadata of the model\n"
