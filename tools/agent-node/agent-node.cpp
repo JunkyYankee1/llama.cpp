@@ -110,7 +110,7 @@ struct cli_args {
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
-            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s",
+            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -176,7 +176,29 @@ struct model_opts {
     std::string device;
     bool        vocab_only = false;
     bool        cpu_moe    = false; // the experts of an MoE model in RAM, the rest on the GPU
+    // with cpu_moe: the experts of the last layers of the part stay on the GPU (the free video memory holds them;
+    // a layer with its experts on the CPU runs 4 times slower, docs/Параллельные сессии.md)
+    int32_t     gpu_expert_layers = 0;
 };
+
+// the number of layers from the metadata of a GGUF file, without loading it
+static int32_t gguf_n_layer(const std::string & path) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        throw std::runtime_error("cannot read the GGUF metadata of " + path);
+    }
+    int32_t n = 0;
+    const int64_t a = gguf_find_key(g, "general.architecture");
+    if (a >= 0 && gguf_get_kv_type(g, a) == GGUF_TYPE_STRING) {
+        const int64_t id = gguf_find_key(g, (std::string(gguf_get_val_str(g, a)) + ".block_count").c_str());
+        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32) {
+            n = (int32_t) gguf_get_val_u32(g, id);
+        }
+    }
+    gguf_free(g);
+    return n;
+}
 
 static llama_model_ptr load_model(const model_opts & mo) {
     llama_model_params mp = llama_model_default_params();
@@ -185,10 +207,25 @@ static llama_model_ptr load_model(const model_opts & mo) {
     mp.layer_end    = mo.layer_end;
     mp.vocab_only   = mo.vocab_only;
 
-    // the experts take most of an MoE layer and only a few of them work per token: in RAM a node holds more layers
+    // the experts take most of an MoE layer and only a few of them work per token: in RAM a node holds more layers.
+    // The experts of the last gpu_expert_layers layers stay on the GPU; the patterns live until the model is loaded
     static const llama_model_tensor_buft_override cpu_moe[] = { llm_ffn_exps_cpu_override(), { nullptr, nullptr } };
+    std::vector<std::string> patterns;
+    std::vector<llama_model_tensor_buft_override> overrides;
     if (mo.cpu_moe && !mo.vocab_only) {
         mp.tensor_buft_overrides = cpu_moe;
+        if (mo.gpu_expert_layers > 0) {
+            const int32_t first = std::max(mo.layer_start, 0);
+            const int32_t last  = mo.layer_end > 0 ? mo.layer_end : gguf_n_layer(mo.path);
+            for (int32_t l = first; l < last - mo.gpu_expert_layers; l++) {
+                patterns.push_back(llm_ffn_block_regex(l, LLM_FFN_EXPS_REGEX));
+            }
+            for (const auto & p : patterns) {
+                overrides.push_back({ p.c_str(), ggml_backend_cpu_buffer_type() });
+            }
+            overrides.push_back({ nullptr, nullptr });
+            mp.tensor_buft_overrides = overrides.data();
+        }
     }
 
     std::vector<ggml_backend_dev_t> devs;
@@ -221,6 +258,7 @@ static model_opts model_opts_from(const cli_args & a) {
     mo.n_gpu_layers = a.get_int("-ngl", "--n-gpu-layers", 999);
     mo.device       = a.get("--device", "-dev", "");
     mo.cpu_moe      = a.has("--cpu-moe");
+    mo.gpu_expert_layers = a.get_int("--gpu-experts", "", 0);
     const std::string layers = a.get("--layers", "", "");
     if (!layers.empty()) {
         const size_t p = layers.find(':');
@@ -1420,6 +1458,26 @@ static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, cons
         for (int32_t l = first; l < last; l++) {
             bytes -= ms.expert_bytes[l];
         }
+        // the video memory left after the rest of the slice takes the experts of the last layers, with the same
+        // headroom the coordinator keeps (10%, at least 512 MB: compute buffers grow, other programs share the GPU)
+        mo.gpu_expert_layers = 0;
+        if (a.has("--gpu-experts")) {
+            mo.gpu_expert_layers = std::clamp(a.get_int("--gpu-experts", "", 0), 0, last - first);
+        } else {
+            const uint64_t headroom = std::max<uint64_t>(vram / 10, 512ull << 20);
+            uint64_t room = vram > bytes + headroom ? vram - bytes - headroom : 0;
+            for (int32_t l = last; l-- > first && ms.expert_bytes[l] <= room;) {
+                room -= ms.expert_bytes[l];
+                mo.gpu_expert_layers++;
+            }
+        }
+        uint64_t gpu_experts = 0;
+        for (int32_t l = last - mo.gpu_expert_layers; l < last; l++) {
+            gpu_experts += ms.expert_bytes[l];
+        }
+        bytes += gpu_experts;
+        AN_LOG("node: the experts of %d of %d layers on the GPU (%s), the rest in RAM\n", mo.gpu_expert_layers, last - first,
+            fmt_gb(gpu_experts).c_str());
     }
     return bytes;
 }
@@ -1849,6 +1907,7 @@ static int cmd_node(const cli_args & a) {
             { "batch_max", srv.batch_max },
             { "forwards", srv.n_forwards.load() },
             { "shared", srv.n_shared.load() },
+            { "gpu_expert_layers", srv.mo.cpu_moe ? srv.mo.gpu_expert_layers : -1 },
             { "vram_full", v.over() > 0 },
         };
         if (v.free >= 0) {
@@ -4125,6 +4184,8 @@ static int cmd_bench_batch(const cli_args & a) {
     cp.n_threads       = n_threads;
     cp.n_threads_batch = n_threads;
     cp.no_perf         = true;
+    // to compare with --gpu-experts: a cache on the GPU for the experts in RAM (llama.cpp, experimental)
+    cp.moe_cache_size  = (size_t) a.get_int("--moe-cache-mib", "", 0) << 20;
     if (!is_last) {
         cp.embeddings   = true;
         cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -4456,7 +4517,8 @@ static void usage() {
         "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
-        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe] [--seqs 1,2,4,8] [-c 512] [-n 32] [--check] [--json F]\n"
+        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M]] [--seqs 1,2,4,8]\n"
+        "                       [-c 512] [-n 32] [--check] [--json F]\n"
         "                       one decode step of the layers for several sequences at once: what batching sessions gives\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
         "                       only the weights of the range (downloaded by HTTP ranges), with the metadata of the model\n"
@@ -4476,7 +4538,8 @@ static void usage() {
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "                  [--relay off|auto|only]  behind NAT: reachable through the relay of the network\n"
         "                  [--p2p on|off]  behind NAT: direct UDP connections through the rendezvous server first (on)\n"
-        "      node|verify [--cpu-moe [--ram-gb N]]  the experts of an MoE model in RAM, the rest on the GPU\n"
+        "      node|verify [--cpu-moe [--ram-gb N] [--gpu-experts N]]  the experts of an MoE model in RAM, the rest on the GPU;\n"
+        "                  the experts of the last N layers on the GPU too (with --model-url: as many as the free memory holds)\n"
         "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
         "                  instead of -m and --layers: the coordinator assigns the layers, the node downloads only them\n"
         "             client --coordinator URL [--spares 1] [--city NAME]              (instead of --chain)\n"
