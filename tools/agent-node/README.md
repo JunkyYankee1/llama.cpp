@@ -75,6 +75,12 @@ a pass takes what came while the previous one ran.
   fewer sessions if they would not fit with `--vram-margin-mb 256` to spare; the coordinator gets the number in `max_sessions`.
 - `--batch-max N` forwards in a pass at most; `1` runs them one at a time (to compare).
 
+With `--cpu-moe` the experts of an MoE model live in RAM and run on the CPU, the rest on the GPU; a layer is then about
+4 times slower (RTX 5060 Ti 8 GB, Qwen3.5-35B-A3B: 0.93 ms against 0.24 ms). `--gpu-experts N` keeps the experts of
+the last N layers of the part on the GPU; with layers from the coordinator the node takes as many as the free video
+memory holds after the rest of the slice, with the headroom the coordinator keeps (10%, at least 512 MB), and tells
+the number in its status (`gpu_expert_layers`).
+
 A forward with `FORWARD_CHECKPOINT` makes every node keep the state of the session after it (the recurrent layers;
 4 per session, the oldest goes first); a later forward may start at that position again. `serve` keeps the chain of
 the last request open (`--keep-chain-s 180`, a session at most 8 minutes) with checkpoints where the system message
