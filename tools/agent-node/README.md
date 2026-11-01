@@ -135,3 +135,13 @@ agent-node client -m model.gguf --coordinator http://coord:8080 -p "Hello" [--sp
   `hello` before it hands the node out. Heartbeats are signed: `Node <expiry>:<hex HMAC(key, "agent-coord/1|<id>|<expiry>")>`.
 - The client asks `POST /v1/chains` with the model key; the reply has the session, the nodes and spares with
   their addresses, pins and session tokens.
+
+## Tests
+
+`tests/run.sh build/bin/agent-node Qwen3.5-0.8B-Q8_0.gguf` runs two nodes of a small model of the same architecture on
+the CPU and checks: several clients at once (shared passes, the answers as the reference's), speculative decoding with
+rejected drafts in two waves (rollback, sequences of ended sessions reused), and `serve` with a fake coordinator
+(`tests/fake_coordinator.py`): the next step of an agent and a new conversation keep their start in the chain and in the
+draft model, the answers do not change, the reports of a session are a running total. CI (`.github/workflows/agent-node.yml`)
+runs it for every pull request to `agent/node`, plus a build with MSVC without CUDA.
+
