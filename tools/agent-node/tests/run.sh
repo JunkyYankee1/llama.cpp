@@ -2,7 +2,8 @@
 # Tests of agent-node on the CPU with a small model of the same architecture as the network model
 # (Qwen3.5-0.8B: hybrid, Gated DeltaNet + attention). Two nodes on this PC, clients against them:
 #   1. several clients at once: forwards of different sessions in one pass, the answers as the reference's
-#   2. speculative decoding (rollback of draft tokens) in two waves: the sequences of ended sessions are reused
+#   2. speculative decoding (rollback of draft tokens) in two waves: the sequences of ended sessions are reused;
+#      the lookup in the text (--lookup), alone and with the draft model
 #   3. serve: the chain and the draft model keep the start of the conversation between requests, the answers do not change
 #
 #   tools/agent-node/tests/run.sh build/bin/agent-node Qwen3.5-0.8B-Q8_0.gguf [WORKDIR]
@@ -34,14 +35,16 @@ CHAIN=127.0.0.1:50152,127.0.0.1:50153
 P1="Write a short poem about the sea."
 P2="Explain what a GPU is in two sentences."
 P3="List three prime numbers and say why they are prime."
+# a text that repeats itself, without the chat template: the lookup in the text finds the next tokens there
+P4="Monday, Tuesday, Wednesday, Thursday, Friday. Monday, Tuesday, Wednesday, Thursday, Friday. Monday, Tuesday,"
 # f32 between the nodes: then the chain differs from the whole model only by the order of sums, the comparison is strict
 GEN="-n 24 -c 1024 -t 2 --ignore-eos"
 # the CPU of a test machine is slow, and three clients share it with two nodes: no failover on a slow step
 CLI="--timeout 30000"
 i=0
-for P in "$P1" "$P2" "$P3"; do
+for P in "$P1" "$P2" "$P3" "$P4"; do
   i=$((i + 1))
-  "$B" reference -m "$M" -p "$P" $GEN --dump "ref$i.txt" > "ref$i.log" 2>&1 || { echo "reference failed"; cat "ref$i.log"; exit 1; }
+  "$B" reference -m "$M" -p "$P" $GEN $([ $i = 4 ] && echo --no-chat) --dump "ref$i.txt" > "ref$i.log" 2>&1 || { echo "reference failed"; cat "ref$i.log"; exit 1; }
 done
 
 echo "== 1. three clients at once"
@@ -74,6 +77,19 @@ for w in 1 2; do
     check "wave $w client $i writes the reference's text" "\"$B\" compare spec$w$i.txt ref$i.txt --tokens 24 > cmp-spec$w$i.log 2>&1"
   done
 done
+"$B" client -m "$M" --chain $CHAIN $CLI -p "$P4" $GEN --no-chat --hidden f32 --lookup --draft-max 4 --dump look4.txt --json look4.json > look4.log 2>&1
+"$B" client -m "$M" --chain $CHAIN $CLI -p "$P4" $GEN --no-chat --hidden f32 --lookup --draft "$M" --draft-max 4 --draft-noise 0.5 --dump lookd4.txt > lookd4.log 2>&1
+look_acc=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["n_lookup_accepted"])' look4.json 2>/dev/null || echo 0)
+check "the lookup proposes tokens the chain accepts ($look_acc)" "[ \"$look_acc\" -gt 0 ]"
+check "the lookup writes the reference's text" "\"$B\" compare look4.txt ref4.txt --tokens 24 > cmp-look4.log 2>&1"
+# spec-replay counts the acceptance on the text alone, without the chain: the same as the client counted over the chain
+"$B" client -m "$M" --chain $CHAIN $CLI -p "$P2" $GEN --hidden f32 --draft "$M" --draft-max 4 --dump specd2.txt --json specd2.json > specd2.log 2>&1
+acc() { python3 -c 'import json, sys; print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])["n_accepted"])' "$1" 2>/dev/null || echo x; }
+"$B" spec-replay look4.txt -m "$M" -p "$P4" --no-chat --lookup --draft-max 4 -n 24 > replay-look4.json 2> replay-look4.log
+"$B" spec-replay specd2.txt -m "$M" -p "$P2" --draft "$M" --draft-max 4 -t 2 > replay-specd2.json 2> replay-specd2.log
+check "spec-replay of the lookup: $(acc replay-look4.json) accepted, the client $(acc look4.json)" "[ \"$(acc replay-look4.json)\" = \"$(acc look4.json)\" ]"
+check "spec-replay of the draft model: $(acc replay-specd2.json) accepted, the client $(acc specd2.json)" "[ \"$(acc replay-specd2.json)\" = \"$(acc specd2.json)\" ]"
+check "the lookup and the draft model together write the reference's text" "\"$B\" compare lookd4.txt ref4.txt --tokens 24 > cmp-lookd4.log 2>&1"
 grep -h '^error' node-a.log node-b.log
 check "no errors on the nodes" "! grep -q '^error' node-a.log node-b.log"
 stop
