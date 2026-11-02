@@ -79,7 +79,7 @@ struct cli_args {
 
     static bool is_flag(const std::string & name) {
         return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose" ||
-               name == "--vocab-only" || name == "--cpu-moe" || name == "--check";
+               name == "--vocab-only" || name == "--cpu-moe" || name == "--check" || name == "--lookup";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -111,6 +111,7 @@ struct cli_args {
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
+            "--lookup",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -2635,6 +2636,8 @@ struct gen_result {
     int32_t n_rounds   = 0; // passes over the chain
     int32_t n_drafted  = 0;
     int32_t n_accepted = 0;
+    int32_t n_lookup_drafted  = 0; // of them, proposed by the lookup in the text (--lookup)
+    int32_t n_lookup_accepted = 0;
     double  draft_ms   = 0; // time of the draft model on the client
     double  verify_ms  = 0; // time of the passes over the chain that check the drafts
 };
@@ -2839,15 +2842,149 @@ struct draft_model {
     }
 };
 
-// speculative decoding over the chain: the draft model proposes n_draft tokens, one pass over the chain checks
-// them all, the longest matching prefix is accepted plus the token of the chain after it. Greedy, so the text is the
-// one the chain would write alone (up to the numeric difference of checking several tokens in one batch)
+// lookup in the text (prompt lookup decoding): the tokens that followed the latest earlier occurrence of the last n
+// tokens of the text, n from n_max down to n_min. Free: no model, no memory. It guesses where the answer repeats the
+// prompt or itself (code being edited, quotes of a document, tool outputs), in free prose it rarely finds anything.
+// Returns the length of the matched suffix (0: nothing found), out gets up to k tokens
+static int32_t lookup_draft(const std::vector<llama_token> & text, int32_t k, int32_t n_min, int32_t n_max, std::vector<llama_token> & out) {
+    out.clear();
+    const int32_t len = (int32_t) text.size();
+    for (int32_t n = std::min(n_max, len - 1); n >= n_min; n--) {
+        const llama_token * suffix = text.data() + len - n;
+        // the latest occurrence that has at least one token after it and is not the suffix itself
+        for (int32_t i = len - n - 1; i >= 0; i--) {
+            if (std::equal(suffix, suffix + n, text.data() + i)) {
+                const int32_t from = i + n;
+                const int32_t m    = std::min(k, len - from);
+                out.assign(text.begin() + from, text.begin() + from + m);
+                return n;
+            }
+        }
+    }
+    return 0;
+}
+
+// the lookup proposes tokens when the last LOOKUP_MIN_N tokens occurred before; with a draft model it takes over
+// only on a longer match (LOOKUP_OVER_DRAFT_N), shorter ones are left to the model, which guesses free text better
+static constexpr int32_t LOOKUP_MIN_N        = 2;
+static constexpr int32_t LOOKUP_MAX_N        = 4;
+static constexpr int32_t LOOKUP_OVER_DRAFT_N = 3;
+
+// who proposes the tokens of speculative decoding: the draft model (may be null), the lookup in the text, or both.
+// The same for a generation over the chain and for spec-replay over a text written before
+struct proposer {
+    draft_model * dm;
+    bool          lookup;
+    int32_t       n_draft;
+    double        noise; // for tests: the share of the draft model's tokens replaced by another token
+    std::mt19937  rng{ 42 };
+    std::uniform_real_distribution<double> uni{ 0.0, 1.0 };
+
+    std::vector<llama_token> text;  // the prompt and every emitted token, for the lookup
+    std::vector<llama_token> found;
+    // how many tokens the lookup proposes: a wrong guess still costs the chain a pass over several tokens (with the
+    // experts on the CPU several times the cost of one), so after a miss it proposes as many as were right, plus one;
+    // after a full hit twice as many
+    int32_t k_look;
+    bool    by_lookup = false; // the last proposal came from the lookup
+
+    int32_t n_drafted = 0, n_accepted = 0, n_lookup_drafted = 0, n_lookup_accepted = 0;
+    double  ms = 0; // time of the draft model
+
+    proposer(draft_model * dm, bool lookup, int32_t n_draft, double noise) : dm(dm), lookup(lookup), n_draft(n_draft), noise(noise), k_look(n_draft) {}
+
+    // the draft model reads the prompt, except its last token: every round starts by decoding the last token.
+    // A conversation that goes on starts at a mark of the last request (the places the chain keeps its state at).
+    // Returns how many tokens of the prompt the draft model had already
+    int32_t read_prompt(const std::vector<llama_token> & prompt, const gen_opts & g) {
+        text = prompt;
+        if (!dm) {
+            return 0;
+        }
+        const double t0 = now_ms();
+        const size_t n_read = prompt.size() - 1;
+        const int32_t cached = dm->start(prompt);
+        for (size_t i = (size_t) cached; i < n_read;) {
+            size_t end = std::min(n_read, i + (size_t) g.n_batch);
+            for (int32_t m : g.marks) {
+                if (m > (int32_t) i && (size_t) m < end) {
+                    end = (size_t) m;
+                }
+            }
+            dm->decode(prompt.data() + i, (uint32_t) (end - i), (int32_t) i);
+            if (std::find(g.marks.begin(), g.marks.end(), (int32_t) end) != g.marks.end()) {
+                dm->keep((int32_t) end);
+            }
+            i = end;
+        }
+        dm->seen.assign(prompt.begin(), prompt.begin() + (ptrdiff_t) n_read);
+        ms += now_ms() - t0;
+        return cached;
+    }
+
+    // the draft model lags one token behind: it still has to process the last prompt token (at pos - 1)
+    void catch_up(llama_token tok, int32_t pos) {
+        if (dm) {
+            const double t0 = now_ms();
+            dm->decode(&tok, 1, pos);
+            ms += now_ms() - t0;
+        }
+    }
+
+    void emitted(llama_token tok) { text.push_back(tok); }
+
+    // up to k tokens after `last` (at pos; the text ends with it): batch = last + the proposed tokens
+    void propose(llama_token last, int32_t pos, int32_t k, std::vector<llama_token> & batch) {
+        const double t0 = now_ms();
+        batch.assign(1, last);
+        const int32_t matched = lookup && k > 0 ? lookup_draft(text, std::min(k, k_look), LOOKUP_MIN_N, LOOKUP_MAX_N, found) : 0;
+        by_lookup = matched >= (dm ? LOOKUP_OVER_DRAFT_N : LOOKUP_MIN_N) && !found.empty();
+        if (dm) {
+            dm->save();
+        }
+        if (by_lookup) {
+            batch.insert(batch.end(), found.begin(), found.end());
+        } else if (dm) {
+            llama_token cur = last;
+            for (int32_t j = 0; j < k; j++) {
+                cur = dm->decode(&cur, 1, pos + j);
+                if (noise > 0 && uni(rng) < noise) {
+                    cur = (cur + 1) % dm->n_vocab;
+                }
+                batch.push_back(cur);
+            }
+        }
+        ms += now_ms() - t0;
+    }
+
+    // a of the proposed tokens were accepted: the draft model goes back to `pos` and reads `last` and them in one batch
+    void accepted(const std::vector<llama_token> & batch, int32_t a, int32_t pos) {
+        const int32_t n_prop = (int32_t) batch.size() - 1;
+        n_drafted  += n_prop;
+        n_accepted += a;
+        if (by_lookup) {
+            n_lookup_drafted  += n_prop;
+            n_lookup_accepted += a;
+            k_look = std::clamp(a == n_prop ? 2 * k_look : a + 1, 1, n_draft);
+        }
+        if (dm) {
+            const double t0 = now_ms();
+            dm->restore(pos);
+            dm->decode(batch.data(), (uint32_t) a + 1, pos);
+            ms += now_ms() - t0;
+        }
+    }
+};
+
+// speculative decoding over the chain: the draft model (dm, may be null) or the lookup in the text proposes up to
+// n_draft tokens, one pass over the chain checks them all, the longest matching prefix is accepted plus the token of
+// the chain after it. The text is the one the chain would write alone (up to the numeric difference of checking
+// several tokens in one batch): acceptance depends only on the text and on who proposes, not on the chain
+// (spec-replay counts it for a text written before)
 // noise: for tests, the share of draft tokens replaced by another token (to exercise partial acceptance)
-static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_vocab * vocab, const std::vector<llama_token> & prompt,
+static gen_result generate_spec(chain_eval & ev, draft_model * dm, bool lookup, const llama_vocab * vocab, const std::vector<llama_token> & prompt,
         const gen_opts & g, int32_t n_draft, double noise, const std::function<void()> & before_gen) {
-    std::mt19937 rng(42);
     std::mt19937 pick(g.seed);
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
     if ((uint32_t) (prompt.size() + g.n_gen + n_draft + 1) > g.n_ctx) {
         throw std::runtime_error("prompt + generation does not fit in the context, increase -c");
     }
@@ -2861,31 +2998,13 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     }
 
     gen_result res;
+    proposer pr(dm, lookup, n_draft, noise);
 
     double t0 = now_ms();
     std::vector<top_entry> top = prefill(ev, prompt, g, res);
     res.prefill_ms = now_ms() - t0;
 
-    // the draft model reads the prompt too, except its last token: every round starts by decoding the last token.
-    // A conversation that goes on starts at a mark of the last request (the places the chain keeps its state at)
-    t0 = now_ms();
-    const size_t n_read = prompt.size() - 1;
-    res.n_draft_cached = dm.start(prompt);
-    for (size_t i = (size_t) res.n_draft_cached; i < n_read;) {
-        size_t end = std::min(n_read, i + (size_t) g.n_batch);
-        for (int32_t m : g.marks) {
-            if (m > (int32_t) i && (size_t) m < end) {
-                end = (size_t) m;
-            }
-        }
-        dm.decode(prompt.data() + i, (uint32_t) (end - i), (int32_t) i);
-        if (std::find(g.marks.begin(), g.marks.end(), (int32_t) end) != g.marks.end()) {
-            dm.keep((int32_t) end);
-        }
-        i = end;
-    }
-    dm.seen.assign(prompt.begin(), prompt.begin() + (ptrdiff_t) n_read);
-    res.draft_ms += now_ms() - t0;
+    res.n_draft_cached = pr.read_prompt(prompt, g);
 
     if (before_gen) {
         before_gen();
@@ -2895,6 +3014,7 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     int32_t n_out = 0;
     auto emit = [&](llama_token tok, const top_entry * row) {
         res.tokens.push_back(tok);
+        pr.emitted(tok);
         if (dump) {
             fprintf(dump, "%d %d", n_out, tok);
             for (uint32_t k = 0; row && k < g.n_top; k++) {
@@ -2918,70 +3038,57 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
     llama_token last = choose_token(top.data(), (uint32_t) top.size(), g, pick);
     int32_t     pos  = (int32_t) prompt.size(); // position of `last` for the chain
     bool done = emit(last, top.data());
-
-    // the draft model lags one token behind: it still has to process prompt.back() at pos - 1
-    {
-        const double td = now_ms();
-        dm.decode(&prompt.back(), 1, pos - 1);
-        res.draft_ms += now_ms() - td;
-    }
+    pr.catch_up(prompt.back(), pos - 1);
 
     t0 = now_ms();
     std::vector<llama_token> batch;
     while (!done) {
-        const int32_t k = std::min<int32_t>(n_draft, g.n_gen - n_out);
+        // 1. the lookup or the draft model proposes up to k tokens after `last`
+        pr.propose(last, pos, std::min<int32_t>(n_draft, g.n_gen - n_out), batch);
+        const int32_t n_prop = (int32_t) batch.size() - 1;
 
-        // 1. the draft model proposes k tokens after `last`
-        const double td = now_ms();
-        dm.save();
-        batch.assign(1, last);
-        llama_token cur = last;
-        for (int32_t j = 0; j < k; j++) {
-            cur = dm.decode(&cur, 1, pos + j);
-            if (noise > 0 && uni(rng) < noise) {
-                cur = (cur + 1) % dm.n_vocab;
-            }
-            batch.push_back(cur);
-        }
-        res.draft_ms += now_ms() - td;
-
-        // 2. one pass over the chain: the greedy choice of the model after every token of the batch
+        // 2. one pass over the chain: the choice of the model after every token of the batch
         const double tv = now_ms();
         const std::vector<top_entry> rows = ev.eval(batch.data(), (uint32_t) batch.size(), pos, true);
         res.verify_ms += now_ms() - tv;
         res.n_rounds++;
-        res.n_drafted += k;
 
         // 3. accept the matching prefix, then the token of the chain after it; with sampling every position is
         //    sampled once, in order, and the first sample that differs from the draft ends the round
         int32_t a = 0;
         llama_token chosen = choose_token(&rows[0], g.n_top, g, pick);
-        while (a < k && chosen == batch[a + 1]) {
+        while (a < n_prop && chosen == batch[a + 1]) {
             a++;
             chosen = choose_token(&rows[(size_t) a * g.n_top], g.n_top, g, pick);
         }
-        res.n_accepted += a;
         for (int32_t j = 0; j < a && !done; j++) {
             done = emit(batch[j + 1], &rows[(size_t) j * g.n_top]);
         }
-        if (done) {
-            break;
+        if (!done) {
+            done = emit(chosen, &rows[(size_t) a * g.n_top]);
         }
-        const llama_token bonus = chosen;
-        done = emit(bonus, &rows[(size_t) a * g.n_top]);
-
-        // 4. the draft model goes back to `pos` and reads the accepted tokens in one batch;
-        //    the nodes roll back by themselves when the next forward starts at pos + a + 1
-        const double tr = now_ms();
-        dm.restore(pos);
-        dm.decode(batch.data(), (uint32_t) a + 1, pos);
-        res.draft_ms += now_ms() - tr;
-
-        last = bonus;
+        // 4. the draft model reads the accepted tokens; the nodes roll back by themselves when the next forward
+        //    starts at pos + a + 1
+        if (!done) {
+            pr.accepted(batch, a, pos);
+        } else {
+            pr.n_drafted += n_prop;
+            pr.n_accepted += a;
+            if (pr.by_lookup) {
+                pr.n_lookup_drafted += n_prop;
+                pr.n_lookup_accepted += a;
+            }
+        }
+        last = chosen;
         pos += a + 1;
     }
     res.gen_ms     = now_ms() - t0;
     res.n_gen_eval = (int32_t) res.tokens.size() - 1;
+    res.n_drafted  = pr.n_drafted;
+    res.n_accepted = pr.n_accepted;
+    res.n_lookup_drafted  = pr.n_lookup_drafted;
+    res.n_lookup_accepted = pr.n_lookup_accepted;
+    res.draft_ms   = pr.ms;
     if (!g.on_token) {
         printf("\n");
     }
@@ -2989,6 +3096,97 @@ static gen_result generate_spec(chain_eval & ev, draft_model & dm, const llama_v
         fclose(dump);
     }
     return res;
+}
+
+// spec-replay: how many proposed tokens would be accepted on a text written before (a dump of the client or of the
+// reference), without a chain: the rounds go as in generate_spec, the text takes the place of the chain's choice
+static int cmd_spec_replay(const cli_args & a) {
+    if (a.positional.size() != 1) {
+        throw std::runtime_error("usage: agent-node spec-replay DUMP -m model.gguf [-p TEXT | -f FILE] [--draft DRAFT.gguf] [--lookup] [--draft-max 6]");
+    }
+    gen_opts g = gen_opts_from(a);
+    const int32_t n_draft = a.get_int("--draft-max", "", 6);
+    if (n_draft < 1 || n_draft > 32) {
+        throw std::runtime_error("--draft-max must be 1..32");
+    }
+    const bool lookup = a.has("--lookup");
+    if (!a.has("--draft") && !lookup) {
+        throw std::runtime_error("spec-replay needs --draft, --lookup or both");
+    }
+    model_opts mo = model_opts_from(a);
+    mo.vocab_only = true;
+    llama_model_ptr model = load_model(mo);
+    const llama_vocab * vocab = llama_model_get_vocab(model.get());
+    const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
+    std::vector<llama_token> tokens;
+    for (const auto & d : read_dump(a.positional[0])) {
+        tokens.push_back(d.token);
+    }
+    if (tokens.size() < 2) {
+        throw std::runtime_error("the dump has fewer than 2 tokens");
+    }
+    // the header of the dump knows the length of the prompt: another prompt would replay a text it did not write
+    {
+        std::ifstream f(u8_path(a.positional[0]));
+        std::string head;
+        std::getline(f, head);
+        const size_t p = head.find("n_prompt=");
+        if (p != std::string::npos && std::stoul(head.substr(p + 9)) != prompt.size()) {
+            throw std::runtime_error("the dump was written for a prompt of " + head.substr(p + 9, head.find(' ', p) - p - 9) +
+                " tokens, this prompt has " + std::to_string(prompt.size()) + " (the same -p/-f and --no-chat as the client?)");
+        }
+    }
+    g.n_ctx = std::max<uint32_t>(g.n_ctx, (uint32_t) (prompt.size() + tokens.size() + n_draft + 1));
+
+    std::unique_ptr<draft_model> dm;
+    if (a.has("--draft")) {
+        model_opts dmo;
+        dmo.path         = a.get("--draft", "", "");
+        dmo.n_gpu_layers = a.get_int("-ngld", "--draft-ngl", 999);
+        dmo.device       = a.get("--device", "-dev", "");
+        dm = std::make_unique<draft_model>(dmo, g.n_ctx, a.get_int("-t", "--threads", common_cpu_get_num_math()));
+        if (dm->n_vocab != llama_vocab_n_tokens(vocab)) {
+            throw std::runtime_error("the draft model has another vocabulary than the model");
+        }
+    }
+    proposer pr(dm.get(), lookup, n_draft, 0.0);
+    pr.read_prompt(prompt, g);
+    pr.emitted(tokens[0]);
+    pr.catch_up(prompt.back(), (int32_t) prompt.size() - 1);
+
+    const int32_t n = (int32_t) tokens.size();
+    int32_t i = 0, rounds = 0;
+    int32_t pos = (int32_t) prompt.size();
+    std::vector<llama_token> batch;
+    while (i + 1 < n) {
+        pr.propose(tokens[i], pos, std::min<int32_t>(n_draft, n - 1 - i), batch);
+        const int32_t n_prop = (int32_t) batch.size() - 1;
+        int32_t acc = 0;
+        while (acc < n_prop && i + 1 + acc < n && batch[acc + 1] == tokens[i + 1 + acc]) {
+            acc++;
+        }
+        rounds++;
+        for (int32_t j = 1; j <= acc + 1 && i + j < n; j++) {
+            pr.emitted(tokens[i + j]);
+        }
+        if (i + 1 + acc >= n) {
+            pr.n_drafted += n_prop;
+            pr.n_accepted += acc;
+            if (pr.by_lookup) {
+                pr.n_lookup_drafted += n_prop;
+                pr.n_lookup_accepted += acc;
+            }
+            break;
+        }
+        pr.accepted(batch, acc, pos);
+        i   += acc + 1;
+        pos += acc + 1;
+    }
+    printf("{\"n_tokens\":%d,\"n_rounds\":%d,\"tok_per_pass\":%.3f,\"n_drafted\":%d,\"n_accepted\":%d,\"accepted_pct\":%.1f,"
+           "\"n_lookup_drafted\":%d,\"n_lookup_accepted\":%d,\"draft_max\":%d,\"draft\":%s,\"lookup\":%s}\n",
+        n, rounds, (double) n / std::max(1, rounds), pr.n_drafted, pr.n_accepted, 100.0 * pr.n_accepted / std::max(1, pr.n_drafted),
+        pr.n_lookup_drafted, pr.n_lookup_accepted, n_draft, dm ? "true" : "false", lookup ? "true" : "false");
+    return 0;
 }
 
 static void print_speed(const gen_result & r) {
@@ -3001,6 +3199,10 @@ static void print_speed(const gen_result & r) {
         AN_LOG("speculative: %d passes over the chain, %.2f tokens per pass, %d of %d draft tokens accepted (%.0f%%), draft model %.1f ms\n",
             r.n_rounds, (double) r.tokens.size() / r.n_rounds, r.n_accepted, r.n_drafted,
             100.0 * r.n_accepted / std::max(1, r.n_drafted), r.draft_ms);
+        if (r.n_lookup_drafted > 0) {
+            AN_LOG("lookup in the text: %d of %d proposed tokens accepted (%.0f%%)\n", r.n_lookup_accepted, r.n_lookup_drafted,
+                100.0 * r.n_lookup_accepted / r.n_lookup_drafted);
+        }
         AN_LOG("per pass: draft model %.1f ms, chain %.1f ms\n", r.draft_ms / r.n_rounds, r.verify_ms / r.n_rounds);
     }
 }
@@ -3051,15 +3253,19 @@ static int cmd_client(const cli_args & a) {
     const std::vector<llama_token> prompt = make_prompt(vocab, model.get(), g);
 
     // speculative decoding: a small draft model on the client, --draft-max tokens per pass over the chain
+    // --lookup: the tokens are also (or only) proposed by the lookup in the text
     std::unique_ptr<draft_model> dm;
     const int32_t n_draft = a.get_int("--draft-max", "", 6);
-    if (a.has("--draft")) {
+    const bool lookup = a.has("--lookup");
+    if (a.has("--draft") || lookup) {
         if (n_draft < 1 || n_draft > 32) {
             throw std::runtime_error("--draft-max must be 1..32");
         }
         if (!g.force.empty()) {
-            throw std::runtime_error("--force and --draft cannot be combined");
+            throw std::runtime_error("--force cannot be combined with --draft or --lookup");
         }
+    }
+    if (a.has("--draft")) {
         model_opts dmo;
         dmo.path         = a.get("--draft", "", "");
         dmo.n_gpu_layers = a.get_int("-ngld", "--draft-ngl", 999);
@@ -3122,7 +3328,7 @@ static int cmd_client(const cli_args & a) {
     co.n_ctx      = g.n_ctx;
     co.n_top      = g.n_top;
     co.hidden     = g.hidden;
-    co.n_rollback = dm ? (uint32_t) n_draft : 0;
+    co.n_rollback = dm || lookup ? (uint32_t) n_draft : 0;
     co.token_ttl  = (uint64_t) a.get_int("--token-ttl", "", 3600);
     if (a.has("--session") && !a.has("--coordinator")) {
         co.session = std::stoull(a.get("--session", "", ""), nullptr, 16);
@@ -3135,8 +3341,8 @@ static int cmd_client(const cli_args & a) {
     std::vector<stats_msg> st0;
     auto before_gen = [&]() { st0 = chain.stats(); };
     const double noise = std::stod(a.get("--draft-noise", "", "0"));
-    const gen_result r = dm ? generate_spec(chain, *dm, vocab, prompt, g, n_draft, noise, before_gen)
-                            : generate(chain, vocab, prompt, g, before_gen);
+    const gen_result r = dm || lookup ? generate_spec(chain, dm.get(), lookup, vocab, prompt, g, n_draft, noise, before_gen)
+                                      : generate(chain, vocab, prompt, g, before_gen);
     const std::vector<stats_msg> st1 = chain.stats();
 
     print_speed(r);
@@ -3174,8 +3380,9 @@ static int cmd_client(const cli_args & a) {
           << ",\"prefill_ms\":" << r.prefill_ms << ",\"n_gen\":" << r.n_gen_eval << ",\"gen_ms\":" << r.gen_ms
           << ",\"tg_tok_s\":" << (r.n_gen_eval > 0 ? r.n_gen_eval * 1000.0 / r.gen_ms : 0.0)
           << ",\"pp_tok_s\":" << r.n_prompt * 1000.0 / std::max(r.prefill_ms, 1e-9)
-          << ",\"draft_max\":" << (dm ? n_draft : 0) << ",\"n_rounds\":" << r.n_rounds
-          << ",\"n_drafted\":" << r.n_drafted << ",\"n_accepted\":" << r.n_accepted << ",\"draft_ms\":" << r.draft_ms << ",\"verify_ms\":" << r.verify_ms
+          << ",\"draft_max\":" << (dm || lookup ? n_draft : 0) << ",\"lookup\":" << (lookup ? "true" : "false") << ",\"n_rounds\":" << r.n_rounds
+          << ",\"n_drafted\":" << r.n_drafted << ",\"n_accepted\":" << r.n_accepted
+          << ",\"n_lookup_drafted\":" << r.n_lookup_drafted << ",\"n_lookup_accepted\":" << r.n_lookup_accepted << ",\"draft_ms\":" << r.draft_ms << ",\"verify_ms\":" << r.verify_ms
           << ",\"n_recoveries\":" << chain.n_recoveries << ",\"recover_max_ms\":" << chain.recover_max_ms
           << ",\"tls\":" << (co.tls ? "true" : "false")
           << ",\"nodes\":[" << nodes_json.str() << "]}\n";
@@ -3219,6 +3426,7 @@ struct serve_state {
     std::string                  key;  // model key for the coordinator
     std::string                  name; // model name for /v1/models
     std::unique_ptr<draft_model> dm;
+    bool                         lookup  = false; // --lookup: proposals from the lookup in the conversation
     int32_t                      n_draft = 6;
     uint32_t                     n_ctx   = 8192;
     int                          spares  = 1;
@@ -3269,7 +3477,8 @@ static int cmd_serve(const cli_args & a) {
     st->n_ctx   = (uint32_t) a.get_int("-c", "--ctx-size", 8192);
     st->spares  = a.get_int("--spares", "", 1);
     st->city    = a.get("--city", "", "");
-    st->n_draft = a.get_int("--draft-max", "", 6);
+    st->n_draft = std::clamp(a.get_int("--draft-max", "", 6), 1, 32);
+    st->lookup  = a.has("--lookup");
     st->keep_s  = a.get_int("--keep-chain-s", "", 180);
     st->acc     = account_from(a);
     if (a.has("--draft")) {
@@ -3452,7 +3661,7 @@ static int cmd_serve(const cli_args & a) {
                 co.n_ctx      = st->n_ctx;
                 co.n_top      = 16; // the candidates for sampling
                 co.hidden     = hidden;
-                co.n_rollback = st->dm ? (uint32_t) st->n_draft : 0;
+                co.n_rollback = st->dm || st->lookup ? (uint32_t) st->n_draft : 0;
                 st->chain = std::make_unique<chain_eval>(co);
                 st->chain_opened  = t_start;
                 st->billed_prompt = st->billed_gen = 0;
@@ -3545,8 +3754,8 @@ static int cmd_serve(const cli_args & a) {
                 }
                 return true;
             };
-            const gen_result r = st->dm ? generate_spec(chain, *st->dm, st->vocab, prompt, g, st->n_draft, 0.0, nullptr)
-                                        : generate(chain, st->vocab, prompt, g, nullptr);
+            const gen_result r = st->dm || st->lookup ? generate_spec(chain, st->dm.get(), st->lookup, st->vocab, prompt, g, st->n_draft, 0.0, nullptr)
+                                                      : generate(chain, st->vocab, prompt, g, nullptr);
             common_chat_input tail;
             if (!pending.empty()) {
                 tail = common_chat_input(pending);
@@ -4557,13 +4766,16 @@ static void usage() {
         "  agent-node client    -m model.gguf --chain HOST:PORT,HOST:PORT,... [-p TEXT | -f FILE] [-n 64] [-c 4096]\n"
         "                       [--top 8] [--ignore-eos] [--no-chat] [--dump FILE] [--json FILE]\n"
         "                       [--hidden q8|f16|f32] [--force REFERENCE_DUMP]\n"
-        "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]]   speculative decoding\n"
+        "                       [--draft DRAFT.gguf [--draft-max 6] [-ngld 999]] [--lookup]   speculative decoding: a draft model,\n"
+        "                       the lookup of the last tokens in the text before, or both\n"
         "  agent-node reference -m model.gguf [-p TEXT | -f FILE] [-n 64] [-c 4096] [-ngl 999] [--device CUDA0] [--dump FILE]\n"
-        "  agent-node serve     -m model.gguf --coordinator URL [--port 8090] [--draft DRAFT.gguf] [-c 8192] [--account FILE]\n"
+        "  agent-node serve     -m model.gguf --coordinator URL [--port 8090] [--draft DRAFT.gguf] [--lookup] [-c 8192] [--account FILE]\n"
         "                       [--keep-chain-s 180]  the local API of the agent (OpenAI-style /v1/chat/completions, reasoning in\n"
         "                       reasoning_content); the chain stays open between requests, the next one reads only the new text\n"
         "  agent-node verify    -m whole-model.gguf --coordinator URL --verifier-token T [--every 60] [--listen-host H --listen-port 50190 --bind-host 0.0.0.0]\n"
         "                       the checker: runs probes through random nodes and reports the verdicts (needs VERIFIER_TOKEN)\n"
+        "  agent-node spec-replay DUMP -m model.gguf [-p TEXT | -f FILE] [--draft DRAFT.gguf] [--lookup] [--draft-max 6]\n"
+        "                       how many proposed tokens would be accepted on the text of a dump, without a chain\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
         "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M]] [--seqs 1,2,4,8]\n"
@@ -4643,6 +4855,9 @@ int main(int argc, char ** argv) {
         // started by the app: exit together with it, even when it crashes (a left-over node or API would hold the port)
         if (a.has("--parent-pid")) {
             watch_parent(std::stoul(a.get("--parent-pid", "", "0")));
+        }
+        if (cmd == "spec-replay") {
+            return cmd_spec_replay(a);
         }
         if (cmd == "compare") {
             return cmd_compare(a);
