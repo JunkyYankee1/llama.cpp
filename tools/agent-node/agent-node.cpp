@@ -110,7 +110,7 @@ struct cli_args {
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
-            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
+            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
             "--lookup",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
@@ -701,6 +701,14 @@ struct node_server {
     // in one pass, and the weights of the part are read once for them all (docs/Параллельные сессии.md)
     std::unique_ptr<model_part> part;
     uint32_t                    batch_max = 4;  // forwards in one pass; 1: one at a time
+    // how long a pass may wait for the generation steps of other sessions, ms (0: never). A client sends its next step
+    // only when it has the result of the last one: without the wait the sessions on one node take turns, and a step
+    // of one waits for the pass of the other instead of sharing it (3.11: 2 clients, 16192 forwards, none shared).
+    // Only a step expected within the wait is waited for: in a chain of several nodes the sessions take turns at
+    // the nodes (a pipeline), the next step comes a pass later, and waiting for it would only slow the chain down
+    double                      batch_wait_ms = 20;
+    // a session whose step ended this recently is generating: the worker expects its next step
+    static constexpr double     generating_ms = 1000;
 
     struct fwd_job : part_job {
         bool done    = false;
@@ -716,8 +724,14 @@ struct node_server {
     uint64_t                  ctx_used = 0;          // tokens of the context promised to open sessions
     // since the start: forwards, and those that ran in a pass with other sessions
     std::atomic<uint64_t>     n_forwards{ 0 }, n_shared{ 0 };
+    std::vector<double>       step_done_ms; // by sequence: when its last generation step ended, 0 - not generating
+    std::vector<double>       away_ms;      // by sequence: from the end of a step to the next one (the rest of the chain
+                                            // and the client), -1 - not known yet
+    double                    pass_ms = 0;  // the last pass of generation steps
 
     void start_worker() {
+        step_done_ms.assign(part->n_seq, 0.0);
+        away_ms.assign(part->n_seq, -1.0);
         for (uint32_t i = part->n_seq; i-- > 0;) {
             free_seqs.push_back((llama_seq_id) i);
         }
@@ -731,7 +745,12 @@ struct node_server {
             {
                 std::unique_lock<std::mutex> lock(q_mtx);
                 q_cv.wait(lock, [&]() { return !queue.empty() || !ended_seqs.empty(); });
+                wait_for_steps(lock);
                 ended.swap(ended_seqs);
+                for (llama_seq_id seq : ended) {
+                    step_done_ms[seq] = 0;
+                    away_ms[seq]      = -1;
+                }
                 // in the order of arrival; a session has at most one forward in the queue (its connection waits for it)
                 pass.clear();
                 uint64_t seqs = 0;
@@ -765,28 +784,76 @@ struct node_server {
             if (pass.empty()) {
                 continue;
             }
+            const double t0 = now_ms();
             {
                 busy_guard guard(*this);
                 std::vector<part_job *> jobs(pass.begin(), pass.end());
                 part->run_batch(jobs.data(), jobs.size());
             }
+            const double t1 = now_ms();
             n_forwards += pass.size();
             if (pass.size() > 1) {
                 n_shared += pass.size();
             }
             {
                 std::lock_guard<std::mutex> lock(q_mtx);
+                const bool steps = std::all_of(pass.begin(), pass.end(), [](const fwd_job * j) { return j->h.n_tokens < long_forward; });
+                if (steps) {
+                    pass_ms = t1 - t0;
+                }
                 for (fwd_job * j : pass) {
                     j->done = true;
+                    step_done_ms[j->seq] = j->h.n_tokens < long_forward ? t1 : 0.0;
                 }
             }
             q_done.notify_all();
         }
     }
 
+    // before a pass of generation steps: waits a little for the steps of the other generating sessions, so that they
+    // run in this pass instead of the next one. Once the sessions share a pass they get the results together and come
+    // back together, and the wait covers only the spread of their round trips. At most half a pass and batch_wait_ms
+    void wait_for_steps(std::unique_lock<std::mutex> & lock) {
+        if (batch_wait_ms <= 0 || pass_ms <= 0 || batch_max < 2) {
+            return;
+        }
+        const double t0       = now_ms();
+        const double deadline = t0 + std::min(batch_wait_ms, pass_ms / 2);
+        while (ended_seqs.empty() && !queue.empty() && queue.size() < batch_max) {
+            if (!std::any_of(queue.begin(), queue.end(), [](const fwd_job * j) { return j->h.n_tokens < long_forward; })) {
+                return; // reading a prompt: nothing to share it with
+            }
+            uint64_t queued = 0;
+            for (const fwd_job * j : queue) {
+                queued |= 1ull << j->seq;
+            }
+            // the next step of a generating session that is not here yet: soon (the session was away so long before,
+            // or it is not known yet) or not within the wait
+            double until = 0;
+            for (size_t seq = 0; seq < step_done_ms.size(); seq++) {
+                if ((queued & (1ull << seq)) || step_done_ms[seq] <= 0 || t0 - step_done_ms[seq] >= generating_ms) {
+                    continue;
+                }
+                const double eta = away_ms[seq] < 0 ? deadline : step_done_ms[seq] + away_ms[seq] * 1.5 + 1;
+                if (eta <= deadline) {
+                    until = std::max(until, eta);
+                }
+            }
+            const double left = until - now_ms();
+            if (until <= 0 || left <= 0) {
+                return;
+            }
+            q_cv.wait_for(lock, std::chrono::microseconds((int64_t) (left * 1000)));
+        }
+    }
+
     // runs the forward in the next pass of the worker
     void run_queued(fwd_job & j) {
         std::unique_lock<std::mutex> lock(q_mtx);
+        if (j.h.n_tokens < long_forward && !step_done_ms.empty() && step_done_ms[j.seq] > 0) {
+            const double away = now_ms() - step_done_ms[j.seq];
+            away_ms[j.seq] = away_ms[j.seq] < 0 ? away : 0.7 * away_ms[j.seq] + 0.3 * away;
+        }
         queue.push_back(&j);
         q_cv.notify_one();
         q_done.wait(lock, [&]() { return j.done; });
@@ -1866,9 +1933,10 @@ static int cmd_node(const cli_args & a) {
     }
     srv.max_sessions = srv.part->n_seq;
     srv.batch_max    = (uint32_t) std::clamp(a.get_int("--batch-max", "", (int) srv.max_sessions), 1, 64);
+    srv.batch_wait_ms = std::clamp(a.get_int("--batch-wait-ms", "", 20), 0, 1000);
     srv.start_worker();
-    AN_LOG("node: %u sessions of up to %u tokens, up to %u forwards in one pass\n", srv.max_sessions,
-        llama_n_ctx(srv.part->ctx.get()) / srv.max_sessions, srv.batch_max);
+    AN_LOG("node: %u sessions of up to %u tokens, up to %u forwards in one pass (waits up to %.0f ms for the others)\n", srv.max_sessions,
+        llama_n_ctx(srv.part->ctx.get()) / srv.max_sessions, srv.batch_max, srv.batch_wait_ms);
 
     // hold the GPU clocks while there are sessions: between tokens the GPU would drop to a power-saving state
     static gpu_clocks clocks; // static: the console handler resets the clocks when the window is closed
@@ -4805,7 +4873,7 @@ static void usage() {
         "security: node [--key HEX | env AGENT_NODE_KEY] [--tls --identity node.pem]\n"
         "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
         "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
-        "sessions: node [--max-sessions 4] [--seq-ctx 16384] [--seq-rollback 6] [--vram-margin-mb 256] [--batch-max N]\n"
+        "sessions: node [--max-sessions 4] [--seq-ctx 16384] [--seq-rollback 6] [--vram-margin-mb 256] [--batch-max N] [--batch-wait-ms 20]\n"
         "               one context for the sessions, fewer if the GPU memory runs short; the forwards waiting at the moment\n"
         "               run in one pass (--batch-max 1: one at a time)\n"
         "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
