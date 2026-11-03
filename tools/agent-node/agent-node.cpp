@@ -702,8 +702,10 @@ struct node_server {
     std::unique_ptr<model_part> part;
     uint32_t                    batch_max = 4;  // forwards in one pass; 1: one at a time
     // how long a pass may wait for the generation steps of other sessions, ms (0: never). A client sends its next step
-    // only when it has the result of the last one: without the wait the sessions take turns, and a step of one waits
-    // for the pass of the other instead of sharing it (3.11: 2 clients, 16192 forwards, none of them shared)
+    // only when it has the result of the last one: without the wait the sessions on one node take turns, and a step
+    // of one waits for the pass of the other instead of sharing it (3.11: 2 clients, 16192 forwards, none shared).
+    // Only a step expected within the wait is waited for: in a chain of several nodes the sessions take turns at
+    // the nodes (a pipeline), the next step comes a pass later, and waiting for it would only slow the chain down
     double                      batch_wait_ms = 20;
     // a session whose step ended this recently is generating: the worker expects its next step
     static constexpr double     generating_ms = 1000;
@@ -723,10 +725,13 @@ struct node_server {
     // since the start: forwards, and those that ran in a pass with other sessions
     std::atomic<uint64_t>     n_forwards{ 0 }, n_shared{ 0 };
     std::vector<double>       step_done_ms; // by sequence: when its last generation step ended, 0 - not generating
+    std::vector<double>       away_ms;      // by sequence: from the end of a step to the next one (the rest of the chain
+                                            // and the client), -1 - not known yet
     double                    pass_ms = 0;  // the last pass of generation steps
 
     void start_worker() {
         step_done_ms.assign(part->n_seq, 0.0);
+        away_ms.assign(part->n_seq, -1.0);
         for (uint32_t i = part->n_seq; i-- > 0;) {
             free_seqs.push_back((llama_seq_id) i);
         }
@@ -744,6 +749,7 @@ struct node_server {
                 ended.swap(ended_seqs);
                 for (llama_seq_id seq : ended) {
                     step_done_ms[seq] = 0;
+                    away_ms[seq]      = -1;
                 }
                 // in the order of arrival; a session has at most one forward in the queue (its connection waits for it)
                 pass.clear();
@@ -821,12 +827,20 @@ struct node_server {
             for (const fwd_job * j : queue) {
                 queued |= 1ull << j->seq;
             }
-            bool expected = false;
-            for (size_t seq = 0; seq < step_done_ms.size() && !expected; seq++) {
-                expected = !(queued & (1ull << seq)) && step_done_ms[seq] > 0 && t0 - step_done_ms[seq] < generating_ms;
+            // the next step of a generating session that is not here yet: soon (the session was away so long before,
+            // or it is not known yet) or not within the wait
+            double until = 0;
+            for (size_t seq = 0; seq < step_done_ms.size(); seq++) {
+                if ((queued & (1ull << seq)) || step_done_ms[seq] <= 0 || t0 - step_done_ms[seq] >= generating_ms) {
+                    continue;
+                }
+                const double eta = away_ms[seq] < 0 ? deadline : step_done_ms[seq] + away_ms[seq] * 1.5 + 1;
+                if (eta <= deadline) {
+                    until = std::max(until, eta);
+                }
             }
-            const double left = deadline - now_ms();
-            if (!expected || left <= 0) {
+            const double left = until - now_ms();
+            if (until <= 0 || left <= 0) {
                 return;
             }
             q_cv.wait_for(lock, std::chrono::microseconds((int64_t) (left * 1000)));
@@ -836,6 +850,10 @@ struct node_server {
     // runs the forward in the next pass of the worker
     void run_queued(fwd_job & j) {
         std::unique_lock<std::mutex> lock(q_mtx);
+        if (j.h.n_tokens < long_forward && !step_done_ms.empty() && step_done_ms[j.seq] > 0) {
+            const double away = now_ms() - step_done_ms[j.seq];
+            away_ms[j.seq] = away_ms[j.seq] < 0 ? away : 0.7 * away_ms[j.seq] + 0.3 * away;
+        }
         queue.push_back(&j);
         q_cv.notify_one();
         q_done.wait(lock, [&]() { return j.done; });
