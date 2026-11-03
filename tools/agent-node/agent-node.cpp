@@ -918,7 +918,17 @@ struct node_server {
                 it = sessions.end();
             }
             if (it != sessions.end()) {
-                throw std::runtime_error("session already open");
+                // the client reopens the session after a timeout (its token is checked above) while the old one is still
+                // busy with a pass: the old one is replaced, not refused, or the client gives up on a node that is alive.
+                // Its sequence goes back to the node when that pass ends
+                AN_LOG("session %" PRIu64 ": reopened, replacing the old one\n", m.session);
+                if (it->second->owner) {
+                    it->second->owner->close();
+                }
+                if (it->second->next) {
+                    it->second->next->close();
+                }
+                sessions.erase(it);
             }
             if (sessions.size() >= max_sessions) {
                 throw std::runtime_error("too many sessions");
@@ -1147,7 +1157,10 @@ struct node_server {
                             const uint64_t id = r.get<uint64_t>();
                             require(id);
                             std::lock_guard<std::mutex> lock(mtx);
-                            sessions.erase(id);
+                            // a late close from the connection of a replaced session must not end the reopened one
+                            if (auto it = sessions.find(id); it != sessions.end() && it->second->owner == conn) {
+                                sessions.erase(it);
+                            }
                         } break;
                         default:
                             throw std::runtime_error("unexpected frame type " + std::to_string((int) type));
@@ -2427,10 +2440,11 @@ struct chain_eval : evaluator {
                 break;
             } catch (const chain_failure & e) {
                 close_chain(false);
-                if (attempt >= 3) {
+                // a node may still finish the pass that timed out: 0.2, 0.4 ... 3.2 s, about 6 s in all
+                if (attempt >= 5) {
                     throw std::runtime_error(std::string("cannot rebuild the chain: ") + e.what());
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                std::this_thread::sleep_for(std::chrono::milliseconds(200 << attempt));
             }
         }
 
