@@ -1,7 +1,8 @@
 #!/bin/sh
 # Tests of agent-node on the CPU with a small model of the same architecture as the network model
 # (Qwen3.5-0.8B: hybrid, Gated DeltaNet + attention). Two nodes on this PC, clients against them:
-#   1. several clients at once: forwards of different sessions in one pass, the answers as the reference's
+#   1. several clients at once: forwards of different sessions in one pass, the answers as the reference's;
+#      two clients keep sharing passes to the end of the generation (--batch-wait-ms)
 #   2. speculative decoding (rollback of draft tokens) in two waves: the sequences of ended sessions are reused;
 #      the lookup in the text (--lookup), alone and with the draft model
 #   3. serve: the chain and the draft model keep the start of the conversation between requests, the answers do not change
@@ -62,6 +63,20 @@ for i in 1 2 3; do
 done
 shared=$(grep -h "in passes with other sessions" node-b.log | sed -E 's/.* ([0-9]+) of them in passes.*/\1/' | awk '{s += $1} END {print s + 0}')
 check "forwards of different sessions ran in one pass ($shared)" "[ $shared -gt 0 ]"
+# two clients: each sends its next step only after the result of the last one. Without --batch-wait-ms the sessions
+# fall into taking turns after the first steps and hardly share a pass; with it they keep sharing them to the end
+before=$(grep -c "in passes with other sessions" node-b.log)
+cp=""
+for i in 2 3; do
+  eval "P=\$P$i"
+  "$B" client -m "$M" --chain $CHAIN $CLI -p "$P" -n 48 -c 1024 -t 2 --ignore-eos --hidden f32 > "pair$i.log" 2>&1 &
+  cp="$cp $!"
+done
+wait $cp
+for i in 1 2 3 4 5; do [ "$(grep -c "in passes with other sessions" node-b.log)" -ge $((before + 2)) ] && break; sleep 1; done
+pair=$(grep "in passes with other sessions" node-b.log | tail -n +$((before + 1)) |
+  sed -E 's/.*: ([0-9]+) forwards, ([0-9]+) of them in passes.*/\1 \2/' | awk '{n += $1; s += $2} END {print (n ? int(100 * s / n) : 0)}')
+check "two clients keep sharing passes ($pair% of the forwards)" "[ $pair -ge 50 ]"
 
 echo "== 2. speculative decoding, two waves"
 for w in 1 2; do
