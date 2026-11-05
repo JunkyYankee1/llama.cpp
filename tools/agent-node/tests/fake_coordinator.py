@@ -1,12 +1,12 @@
 # A coordinator for the tests of serve: one account, the chain of the nodes given on the command line, the reports.
 #   python3 fake_coordinator.py PORT ADDR=PIN [ADDR=PIN ...]
-# The nodes run without --key (open): their tokens are empty. Reports must be a running total per session
+# The nodes run without --key (open): their tokens are empty, the scope of the account comes unsigned. Reports must be a running total per session
 # (serve keeps one session for several requests); a report that goes down is an error, printed and counted.
 import json, secrets, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port = int(sys.argv[1])
-nodes = [{"addr": a, "pin": p, "token": ""} for a, p in (x.split("=", 1) for x in sys.argv[2:])]
+nodes = [{"addr": a, "pin": p, "token": "", "scope": "0123456789abcdef0123456789abcdef:0:0"} for a, p in (x.split("=", 1) for x in sys.argv[2:])]
 reports = {}  # session -> (prompt, gen)
 
 class H(BaseHTTPRequestHandler):

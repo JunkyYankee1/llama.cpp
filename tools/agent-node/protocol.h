@@ -59,6 +59,10 @@ enum forward_flags : uint8_t {
     // start there again, the tokens after it are dropped. The local API starts the next request of a conversation
     // there instead of reading it all again (recurrent layers cannot roll back far without a saved state)
     FORWARD_CHECKPOINT = 2,
+    // the forward ends at the shared start of the prompt the session was opened with (open_msg::prefix_key): every node
+    // keeps the state there in its prefix cache, and a later session of the same account with the same start begins
+    // there instead of reading it (the system message of the agent: instructions and tools, ~2000 tokens)
+    FORWARD_PREFIX = 4,
 };
 
 class writer {
@@ -179,11 +183,18 @@ struct open_msg {
     std::string token;                  // access token of this node for the session (optional field)
     std::string next_token;             // access token of the next node, presented by this node in attach
     std::string next_pin;               // expected certificate fingerprint of the next node ("" = not checked)
+    // the shared start of the prompt (optional fields): the scope of the account, signed by the coordinator for this
+    // node (scope_check), the hash of the tokens of the start and their number. A node that has the state after
+    // them for this scope answers prefix_have = prefix_len, and the session begins there
+    std::string scope;
+    std::string prefix_key;
+    uint32_t    prefix_len = 0;
 
     writer write() const {
         writer w;
         w.put(version).put(session).put(n_ctx).put(n_top).put_str(next).put((uint8_t) hidden).put(n_rollback);
         w.put_str(token).put_str(next_token).put_str(next_pin);
+        w.put_str(scope).put_str(prefix_key).put(prefix_len);
         return w;
     }
     static open_msg read(reader & r) {
@@ -204,6 +215,11 @@ struct open_msg {
             m.next_token = r.get_str();
             m.next_pin   = r.get_str();
         }
+        if (r.left() >= 12) {
+            m.scope      = r.get_str();
+            m.prefix_key = r.get_str();
+            m.prefix_len = r.get<uint32_t>();
+        }
         return m;
     }
 };
@@ -215,10 +231,11 @@ struct open_ok_msg {
     int32_t     n_embd      = 0;
     int32_t     n_vocab     = 0;
     std::string desc; // model description, the client checks that every node runs the same model
+    int32_t     prefix_have = 0; // the session begins after this many tokens: the shared start from the cache (optional)
 
     writer write() const {
         writer w;
-        w.put(layer_start).put(layer_end).put(n_layer).put(n_embd).put(n_vocab).put_str(desc);
+        w.put(layer_start).put(layer_end).put(n_layer).put(n_embd).put(n_vocab).put_str(desc).put(prefix_have);
         return w;
     }
     static open_ok_msg read(reader & r) {
@@ -229,6 +246,9 @@ struct open_ok_msg {
         m.n_embd      = r.get<int32_t>();
         m.n_vocab     = r.get<int32_t>();
         m.desc        = r.get_str();
+        if (r.left() >= 4) {
+            m.prefix_have = r.get<int32_t>();
+        }
         return m;
     }
 };

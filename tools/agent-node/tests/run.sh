@@ -5,7 +5,8 @@
 #      two clients on one node keep sharing passes to the end of the generation (--batch-wait-ms)
 #   2. speculative decoding (rollback of draft tokens) in two waves: the sequences of ended sessions are reused;
 #      the lookup in the text (--lookup), alone and with the draft model
-#   3. serve: the chain and the draft model keep the start of the conversation between requests, the answers do not change
+#   3. serve: the chain and the draft model keep the start of the conversation between requests, the nodes keep the
+#      system message for new chains (the prefix cache), the answers do not change
 #
 #   tools/agent-node/tests/run.sh build/bin/agent-node Qwen3.5-0.8B-Q8_0.gguf [WORKDIR]
 set -u
@@ -118,24 +119,32 @@ echo "== 3. serve keeps the start of the conversation"
 start_nodes tls
 python3 "$T/fake_coordinator.py" 18080 "127.0.0.1:50152=$(cat a.pin)" "127.0.0.1:50153=$(cat b.pin)" > coord.log 2>&1 &
 pids="$pids $!"
-for keep in 180 0; do
-  "$B" serve -m "$M" --coordinator http://127.0.0.1:18080 --port 8090 -c 4096 -t 2 --account "acc$keep.txt" \
-    --keep-chain-s $keep --draft "$M" --draft-max 4 > "serve$keep.log" 2>&1 &
+# base: a new chain for every request, without the prefix cache; 180: the chain stays open between requests (its first
+# request asks the nodes to keep the system message); 0: a new chain for every request, the nodes have the system message
+for run in base 180 0; do
+  keep=${run#base}; keep=${keep:-0}; extra=""
+  [ "$run" = base ] && extra="--no-prefix-cache"
+  "$B" serve -m "$M" --coordinator http://127.0.0.1:18080 --port 8090 -c 4096 -t 2 --account "acc$run.txt" \
+    --keep-chain-s $keep --draft "$M" --draft-max 4 $extra > "serve$run.log" 2>&1 &
   sp=$!
-  for i in $(seq 60); do grep -q "serve ready" "serve$keep.log" && break; sleep 1; done
-  python3 "$T/agent_steps.py" 8090 > "steps$keep.jsonl" 2>&1
+  for i in $(seq 60); do grep -q "serve ready" "serve$run.log" && break; sleep 1; done
+  python3 "$T/agent_steps.py" 8090 > "steps$run.jsonl" 2>&1
   kill $sp; wait $sp 2>/dev/null
 done
 cat steps180.jsonl
 grep -h "serve:" serve180.log
-cached() { sed -n "${1}p" steps180.jsonl | python3 -c 'import json, sys; print(json.load(sys.stdin)["cached"])'; }
+cached() { sed -n "${1}p" "steps${2:-180}.jsonl" | python3 -c 'import json, sys; print(json.load(sys.stdin)["cached"])'; }
 check "the next step reads only the new text ($(cached 2) cached)" "[ \"$(cached 2)\" -gt 0 ]"
 check "a new conversation keeps the system message ($(cached 3) cached)" "[ \"$(cached 3)\" -gt 0 ]"
+check "without the prefix cache a new chain reads the whole prompt ($(cached 1 base) cached)" "[ \"$(cached 1 base)\" -eq 0 ]"
+check "the nodes keep the system message for new chains" "grep -q 'is kept for the next sessions' node-a.log && grep -q 'is kept for the next sessions' node-b.log"
+check "a new chain begins after it ($(cached 1 0), $(cached 3 0) cached)" "[ \"$(cached 1 0)\" -gt 0 ] && [ \"$(cached 3 0)\" -gt 0 ] && grep -q 'from the cache' node-b.log"
 check "the draft model keeps its start too" "grep -E 'serve: .*, [1-9][0-9]* in the draft model' serve180.log | grep -q ."
 answers() { python3 -c 'import json, sys; [print(json.dumps([d["content"], d["tool_calls"]])) for d in map(json.loads, open(sys.argv[1]))]' "$1"; }
+answers stepsbase.jsonl > answersbase.txt
 answers steps180.jsonl > answers180.txt
 answers steps0.jsonl > answers0.txt
-check "the answers are the same as without the cache" "[ \$(wc -l < answers180.txt) -eq 3 ] && cmp -s answers180.txt answers0.txt"
+check "the answers are the same as without the cache" "[ \$(wc -l < answersbase.txt) -eq 3 ] && cmp -s answers180.txt answersbase.txt && cmp -s answers0.txt answersbase.txt"
 check "the reports of a session are a running total" "! grep -q ERROR coord.log && grep -q report coord.log"
 
 [ $fail -eq 0 ] && echo "all tests passed" || { echo "logs: $W"; exit 1; }

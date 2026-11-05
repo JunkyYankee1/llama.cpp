@@ -84,7 +84,7 @@ struct cli_args {
 
     static bool is_flag(const std::string & name) {
         return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose" ||
-               name == "--vocab-only" || name == "--cpu-moe" || name == "--check" || name == "--lookup";
+               name == "--vocab-only" || name == "--cpu-moe" || name == "--check" || name == "--lookup" || name == "--no-prefix-cache";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -116,7 +116,7 @@ struct cli_args {
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--ram-keep-pct", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
-            "--lookup",
+            "--lookup", "--prefix-cache-mb", "--no-prefix-cache",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -314,11 +314,21 @@ static void top_k(const float * logits, int32_t n_vocab, uint32_t k, top_entry *
 }
 
 // one forward frame of one sequence; the forwards of several sequences run in one pass (model_part::run_batch)
+// the state of a sequence after the shared start of a prompt (all layers of the part: KV cache and recurrent states)
+struct prefix_entry {
+    int32_t              pos = 0;
+    std::vector<uint8_t> data;
+};
+
 struct part_job {
     forward_hdr     h;
     const uint8_t * data  = nullptr;
     llama_seq_id    seq   = 0;
     uint32_t        n_top = 8;
+    // the first forward of a session opened at the shared start: the state there goes into the sequence first
+    std::shared_ptr<const prefix_entry> restore;
+    bool                                save_prefix = false; // FORWARD_PREFIX: keep the state after this forward
+    std::shared_ptr<prefix_entry>       saved;               // ... here
 
     // results: not the last part: hidden gets n_tokens rows of n_embd, the last part: top gets n_out rows of n_top
     std::vector<float>     hidden;
@@ -450,6 +460,14 @@ struct model_part {
                     j->err = e.what();
                 }
             }
+            if (j->save_prefix) {
+                // the prefix cache is a convenience: a state that cannot be read does not fail the forward
+                try {
+                    j->saved = save_prefix(j->seq);
+                } catch (const std::exception & e) {
+                    AN_LOG("warning: the start of the prompt is not kept: %s\n", e.what());
+                }
+            }
             try {
                 read(*j);
             } catch (const std::exception & e) {
@@ -463,7 +481,32 @@ struct model_part {
         }
     }
 
+    // the state of seq now, for the prefix cache: the KV cache of its tokens and the recurrent states
+    std::shared_ptr<prefix_entry> save_prefix(llama_seq_id seq) {
+        auto e = std::make_shared<prefix_entry>();
+        e->pos = n_past[seq];
+        e->data.resize(llama_state_seq_get_size(ctx.get(), seq));
+        if (e->data.empty() || llama_state_seq_get_data(ctx.get(), e->data.data(), e->data.size(), seq) != e->data.size()) {
+            throw std::runtime_error("cannot save the state of the sequence");
+        }
+        return e;
+    }
+
 private:
+    // the sequence begins with the state from the prefix cache; a checkpoint there lets the requests of the
+    // conversation start at it again (the recurrent layers cannot roll back to it otherwise)
+    void load_prefix(llama_seq_id seq, const prefix_entry & e) {
+        llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, -1, -1);
+        ckpts[seq].clear();
+        n_past[seq] = 0;
+        if (llama_state_seq_set_data(ctx.get(), e.data.data(), e.data.size(), seq) != e.data.size()) {
+            llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, -1, -1);
+            throw std::runtime_error("cannot restore the shared start of the prompt");
+        }
+        n_past[seq] = e.pos;
+        save_checkpoint(seq);
+    }
+
     void save_checkpoint(llama_seq_id seq) {
         const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
         auto & cs = ckpts[seq];
@@ -513,6 +556,10 @@ private:
         }
         if (batch.size() + (int32_t) h.n_tokens > n_batch) {
             throw std::runtime_error("the pass is full");
+        }
+        if (j.restore) {
+            const auto e = std::move(j.restore);
+            load_prefix(j.seq, *e);
         }
         const bool out_all = h.flags & FORWARD_OUT_ALL;
         if (h.kind == payload::tokens) {
@@ -625,6 +672,65 @@ struct session {
     tcp_conn_ptr                next;  // the next node, null for the last node
     std::mutex                  mtx;
     stats_msg                   st;
+    // the shared start of the prompt: its key in the prefix cache (with the scope of the account) and its length;
+    // restore: the state from the cache, for the first forward of the session
+    std::string                         prefix_key;
+    int32_t                             prefix_len = 0;
+    std::shared_ptr<const prefix_entry> restore;
+};
+
+// the states after the shared starts of prompts, by scope of the account and hash of the tokens. An agent sends the
+// same system message (instructions and tools, ~2000 tokens) with every conversation: a new session begins after it
+// instead of reading it again (a minute on a node with the experts in RAM). The oldest go first when the size is
+// over the limit, and after max_age without use
+struct prefix_cache {
+    size_t max_bytes = 0; // 0: off
+    static constexpr double max_age_ms = 2 * 3600 * 1000.0;
+
+    struct item {
+        std::shared_ptr<const prefix_entry> e;
+        double                              used_ms = 0;
+    };
+    std::mutex                  m;
+    std::map<std::string, item> items;
+    size_t                      bytes = 0;
+
+    std::shared_ptr<const prefix_entry> get(const std::string & key, int32_t pos) {
+        std::lock_guard<std::mutex> lock(m);
+        auto it = items.find(key);
+        if (it == items.end() || it->second.e->pos != pos) {
+            return nullptr;
+        }
+        it->second.used_ms = now_ms();
+        return it->second.e;
+    }
+
+    void put(const std::string & key, std::shared_ptr<const prefix_entry> e) {
+        if (!e || e->data.size() > max_bytes) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m);
+        if (auto it = items.find(key); it != items.end()) {
+            bytes -= it->second.e->data.size();
+            items.erase(it);
+        }
+        bytes += e->data.size();
+        items[key] = { std::move(e), now_ms() };
+        const double t = now_ms();
+        while (!items.empty()) {
+            auto old = items.begin();
+            for (auto it = items.begin(); it != items.end(); ++it) {
+                if (it->second.used_ms < old->second.used_ms) {
+                    old = it;
+                }
+            }
+            if (bytes <= max_bytes && t - old->second.used_ms <= max_age_ms) {
+                break;
+            }
+            bytes -= old->second.e->data.size();
+            items.erase(old);
+        }
+    }
 };
 
 // keeps the GPU of a node awake between tokens. On a network the node waits ~100+ ms for every token; meanwhile the GPU
@@ -910,6 +1016,7 @@ struct node_server {
 
     float corrupt = 0; // --test-corrupt: a dishonest node for the tests of the verifier (noise in the outputs)
 
+    prefix_cache         prefixes;            // --prefix-cache-mb
     std::vector<uint8_t> key;                 // secret key: open and attach need an access token; empty: open node (tests)
     void *               server_ctx = nullptr; // SSL_CTX of incoming connections, null: plain TCP
     void *               client_ctx = nullptr; // SSL_CTX of the connection to the next node
@@ -1026,6 +1133,16 @@ struct node_server {
                 std::to_string(m.n_rollback) + " (agent-node node --seq-rollback)");
         }
         s->n_ctx   = std::max<uint32_t>(m.n_ctx, 1);
+        if (prefixes.max_bytes > 0 && m.prefix_len > 0 && m.prefix_len < s->n_ctx && m.prefix_key.size() == 64 && !m.scope.empty()) {
+#ifdef AGENT_HAVE_TLS
+            // the scope comes signed by the coordinator: a client can spoil only the cache of its own account
+            if (const std::string scope = scope_check(key, m.session, m.scope); !scope.empty()) {
+                s->prefix_key = scope + "|" + m.prefix_key + "|" + std::to_string((int) m.hidden);
+                s->prefix_len = (int32_t) m.prefix_len;
+                s->restore    = prefixes.get(s->prefix_key, s->prefix_len);
+            }
+#endif
+        }
         s->seq     = take_seq(s->n_ctx);
         s->release = [this, seq = s->seq, n = s->n_ctx]() { give_back_seq(seq, n); };
         if (!m.next.empty()) {
@@ -1059,13 +1176,15 @@ struct node_server {
         ok.n_embd      = part->n_embd;
         ok.n_vocab     = part->n_vocab;
         ok.desc        = model_desc(model.get());
+        ok.prefix_have = s->restore ? s->prefix_len : 0;
         {
             std::lock_guard<std::mutex> lock(mtx);
             sessions[m.session] = s;
         }
         authed.insert(m.session);
-        AN_LOG("session %" PRIu64 ": layers [%d, %d), n_ctx = %u, sequence %d, next = %s\n",
-            m.session, ok.layer_start, ok.layer_end, m.n_ctx, (int) s->seq, m.next.empty() ? "(client)" : m.next.c_str());
+        AN_LOG("session %" PRIu64 ": layers [%d, %d), n_ctx = %u, sequence %d, next = %s%s\n",
+            m.session, ok.layer_start, ok.layer_end, m.n_ctx, (int) s->seq, m.next.empty() ? "(client)" : m.next.c_str(),
+            s->restore ? (", the start of the prompt (" + std::to_string(s->prefix_len) + " tokens) from the cache").c_str() : "");
         send_frame(*conn, msg::open_ok, ok.write());
     }
 
@@ -1087,9 +1206,25 @@ struct node_server {
         j.data  = data;
         j.seq   = s->seq;
         j.n_top = s->n_top;
+        {
+            std::lock_guard<std::mutex> lock(s->mtx);
+            // the state from the cache only for a session that goes on after it (a client that does not use it
+            // starts at 0: nothing to restore)
+            if (s->restore && h.pos0 >= s->restore->pos) {
+                j.restore = s->restore;
+            }
+            s->restore.reset();
+        }
+        j.save_prefix = (h.flags & FORWARD_PREFIX) && !s->prefix_key.empty() && (int64_t) h.pos0 + h.n_tokens == s->prefix_len;
         run_queued(j);
         if (!j.err.empty()) {
             throw std::runtime_error(j.err);
+        }
+        if (j.saved) {
+            const size_t n = j.saved->data.size();
+            prefixes.put(s->prefix_key, std::move(j.saved));
+            AN_LOG("session %" PRIu64 ": the start of the prompt (%d tokens, %.1f MB) is kept for the next sessions\n",
+                h.session, s->prefix_len, n / 1e6);
         }
         std::vector<float> &     hidden = j.hidden;
         std::vector<top_entry> & top    = j.top;
@@ -1609,6 +1744,7 @@ struct node_ref {
     std::string key;   // secret key of the node, to issue tokens itself (tests; normally the coordinator issues them)
     std::string token; // access token issued by the coordinator for the session
     std::string pin;   // expected certificate fingerprint ("" = not checked)
+    std::string scope; // the scope of the account, signed for this node (the prefix cache of the node)
 };
 
 // the identity of this PC for the coordinator: the welcome points go only to the first account of a PC.
@@ -1742,7 +1878,8 @@ static coord_chain request_chain(coord_account & acc, const std::string & model_
     auto refs_of = [](const json & arr) {
         std::vector<node_ref> out;
         for (const auto & n : arr) {
-            out.push_back({ n.at("addr").get<std::string>(), "", n.at("token").get<std::string>(), n.at("pin").get<std::string>() });
+            out.push_back({ n.at("addr").get<std::string>(), "", n.at("token").get<std::string>(), n.at("pin").get<std::string>(),
+                n.value("scope", std::string()) });
         }
         return out;
     };
@@ -1879,6 +2016,7 @@ static int cmd_node(const cli_args & a) {
     }
     srv.n_threads = a.get_int("-t", "--threads", common_cpu_get_num_math());
     srv.corrupt   = std::stof(a.get("--test-corrupt", "", "0"));
+    srv.prefixes.max_bytes = (size_t) std::max(0, a.get_int("--prefix-cache-mb", "", 512)) << 20;
 
     const std::string host = a.get("--host", "", "127.0.0.1");
     const int         port = a.get_int("--port", "", 50152);
@@ -2198,6 +2336,10 @@ struct chain_opts {
     uint64_t session        = 0;    // 0: chosen by the client
     uint64_t token_ttl      = 3600;
     int      max_recoveries = 5;
+    // the shared start of the prompts (the system message of the agent) and its hash: the nodes that keep the state
+    // after it begin the session there; the forward that ends there asks them to keep it (FORWARD_PREFIX)
+    std::vector<llama_token> prefix;
+    std::string              prefix_key;
 };
 
 // a node failed: closed connection, error or timeout; the chain can be rebuilt
@@ -2242,6 +2384,9 @@ struct chain_eval : evaluator {
     uint64_t                      gen = 0; // connections of older generations are ignored
     void *                        cctx = nullptr;
 
+    int32_t prefix_loaded = 0;     // the nodes of the chain begin after o.prefix (all of them have it), else 0
+    bool    prefix_off    = false; // a node could not restore it: the chain reads the whole prompt from now on
+
     int    n_recoveries = 0;
     double recover_ms   = 0;     // total pause of the generation for recoveries
     double recover_max_ms = 0;
@@ -2258,6 +2403,10 @@ struct chain_eval : evaluator {
 #endif
         sid = o.session ? o.session : random_session();
         open_chain();
+        if (prefix_loaded > 0) {
+            hist = o.prefix;
+            ckpts.push_back(prefix_loaded);
+        }
     }
 
     ~chain_eval() override {
@@ -2348,6 +2497,11 @@ struct chain_eval : evaluator {
                 m.next_token = token_for(cur[i + 1]);
                 m.next_pin   = cur[i + 1].pin;
             }
+            if (use_prefix() && !cur[i].scope.empty()) {
+                m.scope      = cur[i].scope;
+                m.prefix_key = o.prefix_key;
+                m.prefix_len = (uint32_t) o.prefix.size();
+            }
             if (!send_frame(*conns[i], msg::open, m.write())) {
                 throw chain_failure("node " + addrs[i] + " closed the connection");
             }
@@ -2369,7 +2523,19 @@ struct chain_eval : evaluator {
         if (parts.back().layer_end != parts.back().n_layer) {
             throw std::runtime_error("the chain stops at layer " + std::to_string(parts.back().layer_end));
         }
+        // the start helps only when every node has it; the others begin at 0, and so do the nodes that have it
+        prefix_loaded = use_prefix() ? (int32_t) o.prefix.size() : 0;
+        for (const auto & p : parts) {
+            if (p.prefix_have != prefix_loaded) {
+                prefix_loaded = 0;
+            }
+        }
+        if (prefix_loaded > 0) {
+            AN_LOG("the nodes have the start of the prompt (%d tokens) already\n", prefix_loaded);
+        }
     }
+
+    bool use_prefix() const { return !prefix_off && !o.prefix.empty() && o.prefix_key.size() == 64; }
 
     void close_chain(bool polite) {
         for (auto & c : conns) {
@@ -2435,6 +2601,10 @@ struct chain_eval : evaluator {
         h.n_tokens = n;
         h.kind     = payload::tokens;
         h.flags    = (out_all ? FORWARD_OUT_ALL : 0) | (checkpoint ? FORWARD_CHECKPOINT : 0);
+        // the forward ends at the shared start, and the nodes did not have it: they keep it for the next sessions
+        if (use_prefix() && prefix_loaded == 0 && hist.size() == o.prefix.size() && hist == o.prefix) {
+            h.flags |= FORWARD_PREFIX;
+        }
         writer w;
         h.write(w);
         w.put_bytes(tokens, (size_t) n * sizeof(llama_token));
@@ -2470,6 +2640,9 @@ struct chain_eval : evaluator {
             } catch (const chain_failure & e) {
                 if (n_recoveries >= o.max_recoveries) {
                     throw std::runtime_error(std::string("the chain failed again: ") + e.what());
+                }
+                if (std::string(e.what()).find("shared start of the prompt") != std::string::npos) {
+                    prefix_off = true;
                 }
                 recover(pos0, e.what());
             }
@@ -2559,14 +2732,21 @@ struct chain_eval : evaluator {
         const std::vector<llama_token> pre(hist.begin(), hist.begin() + std::min<size_t>(pos0, hist.size()));
         hist.clear();
         ckpts.clear(); // the new nodes keep no states yet
-        for (size_t i = 0; i < pre.size(); i += 512) {
+        // ... except the shared start of the prompt, when they all have it
+        size_t from = 0;
+        if (prefix_loaded > 0 && pre.size() >= (size_t) prefix_loaded && std::equal(o.prefix.begin(), o.prefix.end(), pre.begin())) {
+            hist = o.prefix;
+            ckpts.push_back(prefix_loaded);
+            from = (size_t) prefix_loaded;
+        }
+        for (size_t i = from; i < pre.size(); i += 512) {
             const uint32_t n = (uint32_t) std::min<size_t>(512, pre.size() - i);
             eval_once(pre.data() + i, n, (int32_t) i, false);
         }
         const double dt = now_ms() - t0;
         recover_ms    += dt;
         recover_max_ms = std::max(recover_max_ms, dt);
-        AN_LOG("chain recovered in %.0f ms, %zu tokens of context read again\n", dt, pre.size());
+        AN_LOG("chain recovered in %.0f ms, %zu tokens of context read again\n", dt, pre.size() - from);
     }
 
     // how many first tokens of a new prompt can stay in the memory of the chain: up to the longest common start, where
@@ -3423,7 +3603,7 @@ static int cmd_client(const cli_args & a) {
         }
         std::vector<node_ref> out;
         for (size_t i = 0; i < ad.size(); i++) {
-            out.push_back({ ad[i], keys.empty() ? "" : keys[i], tokens.empty() ? "" : tokens[i], pins.empty() ? "" : pins[i] });
+            out.push_back({ ad[i], keys.empty() ? "" : keys[i], tokens.empty() ? "" : tokens[i], pins.empty() ? "" : pins[i], "" });
         }
         return out;
     };
@@ -3562,6 +3742,7 @@ struct serve_state {
     double                       chain_opened = 0, chain_used = 0;
     int                          keep_s = 180;
     static constexpr int         max_age_s = 480;
+    bool                         prefix_cache = true; // a new chain asks the nodes for the system message (--no-prefix-cache)
     int64_t                      billed_prompt = 0, billed_gen = 0; // of the session, for the report (a running total)
 };
 
@@ -3601,6 +3782,7 @@ static int cmd_serve(const cli_args & a) {
     st->n_draft = std::clamp(a.get_int("--draft-max", "", 6), 1, 32);
     st->lookup  = a.has("--lookup");
     st->keep_s  = a.get_int("--keep-chain-s", "", 180);
+    st->prefix_cache = !a.has("--no-prefix-cache");
     st->acc     = account_from(a);
     if (a.has("--draft")) {
         model_opts dmo;
@@ -3783,10 +3965,19 @@ static int cmd_serve(const cli_args & a) {
                 co.n_top      = 16; // the candidates for sampling
                 co.hidden     = hidden;
                 co.n_rollback = st->dm || st->lookup ? (uint32_t) st->n_draft : 0;
+#ifdef AGENT_HAVE_TLS
+                // the system message (instructions and tools) is the same in every conversation of the agent: the nodes
+                // keep the state after it for this account, and a new chain begins there (64+ tokens: else not worth it)
+                if (st->prefix_cache && sys_end >= 64) {
+                    co.prefix.assign(prompt.begin(), prompt.begin() + sys_end);
+                    const std::string m = st->key + "|" + std::string((const char *) co.prefix.data(), co.prefix.size() * sizeof(llama_token));
+                    co.prefix_key = sha256_hex(m.data(), m.size());
+                }
+#endif
                 st->chain = std::make_unique<chain_eval>(co);
                 st->chain_opened  = t_start;
                 st->billed_prompt = st->billed_gen = 0;
-                n_cached = 0;
+                n_cached = st->chain->reusable(prompt);
                 if (st->chain->parts[0].n_vocab != llama_vocab_n_tokens(st->vocab)) {
                     st->chain.reset();
                     throw std::runtime_error("the tokenizer does not match the model of the chain");
@@ -3807,7 +3998,8 @@ static int cmd_serve(const cli_args & a) {
             gen_opts g;
             g.n_cached    = n_cached;
             for (int32_t p : { sys_end, boundary }) {
-                if (p > n_cached && st->keep_s > 0) {
+                // the batch that ends at the system message also keeps it in the prefix cache of the nodes
+                if (p > n_cached && (st->keep_s > 0 || (p == sys_end && st->prefix_cache))) {
                     g.checkpoints.push_back(p);
                 }
                 if (p > 0) {
@@ -4915,6 +5107,8 @@ static void usage() {
         "sessions: node [--max-sessions 4] [--seq-ctx 16384] [--seq-rollback 6] [--vram-margin-mb 256] [--batch-max N] [--batch-wait-ms 20]\n"
         "               one context for the sessions, fewer if the GPU memory runs short; the forwards waiting at the moment\n"
         "               run in one pass (--batch-max 1: one at a time)\n"
+        "               [--prefix-cache-mb 512]  the states after the shared starts of prompts (the system message of the\n"
+        "               agent), by account: a new session begins after it (0: off)\n"
         "gpu:      node [--gpu-clocks auto|off]   hold the NVIDIA GPU clocks while there are sessions (needs administrator)\n"
         "               [--keep-warm 0] [--keep-warm-mb 24]   or keep the GPU awake with small jobs between tokens (ms)\n"
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
