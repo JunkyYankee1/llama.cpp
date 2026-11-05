@@ -122,6 +122,55 @@ inline std::string token_check(const std::vector<uint8_t> & key, uint64_t sessio
     return "";
 }
 
+// the scope of the account of a session, signed by the coordinator for this node:
+// "<scope, 32 hex>:<expiry>:<hex HMAC(key, "agent-scope/1|<session hex>|<scope>|<expiry>")>" (nodeauth.IssueScope).
+// The scope when the signature is valid, else "". A node without a key (tests) takes the scope unsigned
+inline std::string scope_check(const std::vector<uint8_t> & key, uint64_t session, const std::string & token) {
+    if (token.size() < 33 || token[32] != ':') {
+        return "";
+    }
+    const std::string scope = token.substr(0, 32);
+    for (char c : scope) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return "";
+        }
+    }
+    if (key.empty()) {
+        return scope;
+    }
+    const size_t p = token.find(':', 33);
+    if (p == std::string::npos) {
+        return "";
+    }
+    uint64_t expiry = 0;
+    try {
+        expiry = std::stoull(token.substr(33, p - 33));
+    } catch (const std::exception &) {
+        return "";
+    }
+    if (expiry < unix_now()) {
+        return "";
+    }
+    const std::string want = hmac_hex(key, "agent-scope/1|" + session_hex(session) + "|" + scope + "|" + std::to_string(expiry));
+    const std::string got  = token.substr(p + 1);
+    if (got.size() != want.size() || CRYPTO_memcmp(got.data(), want.data(), want.size()) != 0) {
+        return "";
+    }
+    return scope;
+}
+
+inline std::string scope_issue(const std::string & key_hex, uint64_t session, const std::string & scope, uint64_t ttl_s) {
+    const uint64_t expiry = unix_now() + ttl_s;
+    return scope + ":" + std::to_string(expiry) + ":" +
+           hmac_hex(from_hex(key_hex), "agent-scope/1|" + session_hex(session) + "|" + scope + "|" + std::to_string(expiry));
+}
+
+inline std::string sha256_hex(const void * data, size_t n) {
+    uint8_t md[32];
+    SHA256((const uint8_t *) data, n, md);
+    return to_hex(md, sizeof(md));
+}
+
 // the key pair and certificate of a node, loaded from a PEM file or created and saved there
 struct tls_identity {
     EVP_PKEY * pkey = nullptr;
