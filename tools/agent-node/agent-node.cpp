@@ -22,6 +22,11 @@
 #    undef X509_EXTENSIONS
 #    undef OCSP_REQUEST
 #    undef OCSP_RESPONSE
+#else
+#    include <fcntl.h>
+#    include <sys/file.h>
+#    include <unistd.h>
+#    include <cerrno>
 #endif
 #include "vram.h"
 
@@ -109,7 +114,7 @@ struct cli_args {
             "--token-ttl", "--key", "--identity", "--ttl", "--coordinator", "--public-addr", "--city", "--spares",
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
-            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
+            "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--ram-keep-pct", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
             "--lookup",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
@@ -1462,7 +1467,9 @@ static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, cons
         AN_LOG("node: at most %s for the model: the last layers did not fit in the video memory\n", fmt_gb(vram).c_str());
     }
 
-    // RAM for the experts of an MoE model (--cpu-moe): the free memory minus 4 GB for the system, or --ram-gb
+    // RAM for the experts of an MoE model (--cpu-moe): the free memory minus what stays for the owner of the PC —
+    // --ram-keep-pct of all the memory (25), but at least 4 GB — or --ram-gb. A fixed 4 GB left a 32 GB PC with
+    // nothing for a browser and a game next to the node: Windows pushed the experts to the page file, the PC froze
     uint64_t ram = 0;
     if (mo.cpu_moe) {
         if (a.has("--ram-gb")) {
@@ -1470,9 +1477,11 @@ static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, cons
         } else if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(cpu, &free, &total);
-            const uint64_t reserve = 4ull << 30;
+            const int      keep_pct = std::clamp(a.get_int("--ram-keep-pct", "", 25), 0, 90);
+            const uint64_t reserve  = std::max<uint64_t>(4ull << 30, (uint64_t) total / 100 * keep_pct);
             ram = free > reserve ? free - reserve : 0;
-            AN_LOG("node: RAM %s free of %s, %s for the experts\n", fmt_gb(free).c_str(), fmt_gb(total).c_str(), fmt_gb(ram).c_str());
+            AN_LOG("node: RAM %s free of %s, %s stay for the system (%d%%), %s for the experts\n", fmt_gb(free).c_str(),
+                fmt_gb(total).c_str(), fmt_gb(reserve).c_str(), keep_pct, fmt_gb(ram).c_str());
         }
     }
 
@@ -1829,6 +1838,32 @@ static void relay_listen(node_server & srv, const std::string & coord, const std
     }
 }
 
+// one node per identity: two agent-node with one key take turns at the relay (each LISTEN closes the other's)
+// and drop each other's sessions — 4.11 a second copy started by hand next to the app did exactly that.
+// The lock is held until the process ends (the system releases it even after a crash).
+static void lock_identity(const std::string & identity) {
+    const std::string path = identity + ".lock";
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool busy = h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION;
+    if (h == INVALID_HANDLE_VALUE && !busy) {
+        AN_LOG("warning: cannot open %s (error %lu): no check for a second node\n", path.c_str(), (unsigned long) GetLastError());
+        return;
+    }
+#else
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        AN_LOG("warning: cannot open %s: no check for a second node\n", path.c_str());
+        return;
+    }
+    const bool busy = flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+#endif
+    if (busy) {
+        throw std::runtime_error("another agent-node is already running with the identity " + identity +
+                                 ": two nodes with one key drop each other at the relay; stop the other one first");
+    }
+}
+
 static int cmd_node(const cli_args & a) {
     node_server srv;
     const bool assigned = a.has("--model-url");
@@ -1868,7 +1903,11 @@ static int cmd_node(const cli_args & a) {
 #ifdef AGENT_HAVE_TLS
     tls_identity identity;
     if (a.has("--tls")) {
-        identity.load_or_create(a.get("--identity", "", ""));
+        const std::string id_path = a.get("--identity", "", "");
+        if (!id_path.empty()) {
+            lock_identity(id_path);
+        }
+        identity.load_or_create(id_path);
         fingerprint      = identity.fingerprint();
         srv.server_ctx   = tls_server_ctx(identity);
         srv.client_ctx   = tls_client_ctx();
@@ -4881,7 +4920,8 @@ static void usage() {
         "coordinator: node --coordinator URL [--public-addr HOST:PORT] [--city NAME]   (needs --tls and --key)\n"
         "                  [--relay off|auto|only]  behind NAT: reachable through the relay of the network\n"
         "                  [--p2p on|off]  behind NAT: direct UDP connections through the rendezvous server first (on)\n"
-        "      node|verify [--cpu-moe [--ram-gb N] [--moe-cache-mib M | --gpu-experts N]]  the experts of an MoE model in RAM,\n"
+        "      node|verify [--cpu-moe [--ram-gb N | --ram-keep-pct 25] [--moe-cache-mib M | --gpu-experts N]]  the experts of an MoE model in RAM,\n"
+        "                  (--ram-keep-pct: the share of all RAM left to the system, at least 4 GB),\n"
         "                  the rest on the GPU; a cache of M MB of them on the GPU (with --model-url: what the free memory holds),\n"
         "                  or the experts of the last N layers on the GPU\n"
         "             node --model-url URL [--models-dir models] [--disk-gb 25] [--vram-gb N | --vram-reserve-mb 1024] [--mirror URL]\n"
