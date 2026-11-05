@@ -29,6 +29,7 @@
 #    include <cerrno>
 #endif
 #include "vram.h"
+#include "bench_experts.h"
 
 #include "chat.h"
 #include "common.h"
@@ -116,7 +117,7 @@ struct cli_args {
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--ram-keep-pct", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
-            "--lookup", "--prefix-cache-mb", "--no-prefix-cache",
+            "--lookup", "--prefix-cache-mb", "--no-prefix-cache", "--types",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -4883,6 +4884,136 @@ static int cmd_bench_batch(const cli_args & a) {
     return 0;
 }
 
+// bench-experts: the experts of an MoE model in RAM on this CPU, by weight type and number of threads, against the
+// RAM bandwidth (bench_experts.h). No model file needed; ~1 GB of RAM.
+static std::vector<std::string> split_list(const std::string & s) {
+    std::vector<std::string> out;
+    std::stringstream        ss(s);
+    for (std::string x; std::getline(ss, x, ',');) {
+        if (!x.empty()) {
+            out.push_back(x);
+        }
+    }
+    return out;
+}
+
+static bool strcasecmp_ascii(const std::string & x, const std::string & y) {
+    return x.size() == y.size() && std::equal(x.begin(), x.end(), y.begin(), [](char c1, char c2) { return std::tolower((unsigned char) c1) == std::tolower((unsigned char) c2); });
+}
+
+static int cmd_bench_experts(const cli_args & a) {
+    using namespace bench_experts;
+    const int n_hw = (int) std::max(1u, std::thread::hardware_concurrency());
+    std::vector<int> threads;
+    if (a.has("--threads") || a.has("-t")) {
+        for (const auto & x : split_list(a.get("--threads", "-t", ""))) {
+            threads.push_back(std::max(1, std::stoi(x)));
+        }
+    } else {
+        for (int t = 1; t < n_hw; t *= 2) {
+            threads.push_back(t);
+        }
+        if (n_hw / 2 > 1 && std::find(threads.begin(), threads.end(), n_hw / 2) == threads.end()) {
+            threads.push_back(n_hw / 2);
+        }
+        threads.push_back(n_hw);
+        std::sort(threads.begin(), threads.end());
+    }
+    std::vector<int> tokens;
+    for (const auto & x : split_list(a.get("--tokens", "", "1"))) {
+        tokens.push_back(std::max(1, std::stoi(x)));
+    }
+    // the formats of the experts of the Qwen GGUF files: 1-2 bits for the biggest models, 3-4 for the smaller ones
+    const std::string def = "q1_0,iq1_m,iq2_xxs,iq2_xs,q2_K,iq3_xxs,iq3_s,q3_K,iq4_xs,q4_K,q4_K+repack,q4_0+repack,iq4_nl+repack";
+    std::vector<variant> vs;
+    for (const auto & name : split_list(a.get("--types", "", def))) {
+        const bool        rp   = name.size() > 7 && name.compare(name.size() - 7, 7, "+repack") == 0;
+        const std::string base = rp ? name.substr(0, name.size() - 7) : name;
+        int               found = -1;
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const char * tn = ggml_type_name((ggml_type) t);
+            if (tn && ggml_get_type_traits((ggml_type) t)->blck_size > 0 && strcasecmp_ascii(tn, base)) {
+                found = t;
+            }
+        }
+        if (found < 0) {
+            throw std::runtime_error("bench-experts: unknown weight type " + base);
+        }
+        if (rp && found != GGML_TYPE_Q4_0 && found != GGML_TYPE_Q4_K && found != GGML_TYPE_IQ4_NL) {
+            throw std::runtime_error("bench-experts: the CPU repacks only q4_0, q4_K and iq4_nl");
+        }
+        vs.push_back({ (ggml_type) found, rp });
+    }
+
+    ggml_log_set(log_callback, nullptr); // the CPU backend logs every repacked tensor
+    runner R;
+    const cpu_flags f = detect_cpu();
+    printf("CPU: %s, %d threads\n", ggml_backend_dev_description(R.dev), n_hw);
+    printf("instructions of the CPU: %s%s%s%s%s%s\n", f.avx2 ? "AVX2" : "no AVX2", f.avx_vnni ? " AVX-VNNI" : "", f.avx512f ? " AVX-512" : "",
+        f.avx512_vnni ? " VNNI-512" : "", f.avx512_vbmi ? " VBMI" : "", f.avx512_bf16 ? " BF16-512" : "");
+    const std::string feat = backend_features(ggml_backend_dev_backend_reg(R.dev));
+    printf("the CPU backend is built for: %s\n", feat.empty() ? "?" : feat.c_str());
+    if (!R.repack) {
+        printf("no CPU_REPACK buffer in this build: the +repack rows are skipped\n");
+    }
+
+    std::vector<uint64_t> buf((size_t) 512 << 17, 1); // 512 MiB, far beyond the CPU caches
+    std::vector<double>   ram;
+    printf("\nRAM read, GB/s by threads:");
+    for (int t : threads) {
+        ram.push_back(ram_gbps(buf, t));
+        printf("  %d: %.1f", t, ram.back());
+        fflush(stdout);
+    }
+    printf("\n");
+    buf.clear();
+    buf.shrink_to_fit();
+
+    json rows = json::array();
+    for (int nt : tokens) {
+        printf("\nexpert block of one layer of Qwen3.5-35B-A3B, %d token%s: GB/s of weights processed by threads (more is better)\n", nt, nt > 1 ? "s" : "");
+        printf("%-14s %5s", "type", "bits");
+        for (int t : threads) {
+            printf(" %6d", t);
+        }
+        printf("  us/layer at %d\n", threads.back());
+        for (const auto & v : vs) {
+            if (v.repack && !R.repack) {
+                continue;
+            }
+            std::vector<result> res;
+            try {
+                res = R.run(v, threads, { nt }, 0.4);
+            } catch (const std::exception & e) {
+                printf("%-14s %s\n", ggml_type_name(v.type), e.what());
+                continue;
+            }
+            printf("%-14s %5.2f", res[0].name.c_str(), res[0].bpw);
+            for (const auto & r : res) {
+                printf(" %6.1f", r.weight_gbps);
+                rows.push_back({ { "type", r.name }, { "bpw", r.bpw }, { "threads", r.threads }, { "tokens", r.tokens },
+                                 { "us_per_layer", r.us_per_layer }, { "weight_gbps", r.weight_gbps } });
+            }
+            printf("  %8.0f\n", res.back().us_per_layer);
+            fflush(stdout);
+        }
+    }
+    printf("\nA type keeps up with the RAM when its GB/s reach the RAM line at the same threads; below it, the CPU is the limit.\n");
+    const std::string out = a.get("--json", "", "");
+    if (!out.empty()) {
+        json jr = json::array();
+        for (size_t i = 0; i < threads.size(); i++) {
+            jr.push_back({ { "threads", threads[i] }, { "gbps", ram[i] } });
+        }
+        std::ofstream(u8_path(out)) << json({ { "cpu", ggml_backend_dev_description(R.dev) }, { "hw_threads", n_hw },
+                                              { "avx2", f.avx2 }, { "avx512", f.avx512f }, { "avx512_vnni", f.avx512_vnni }, { "avx512_vbmi", f.avx512_vbmi },
+                                              { "avx_vnni", f.avx_vnni }, { "backend_features", feat }, { "ram", jr }, { "rows", rows } })
+                                           .dump(1)
+                                    << "\n";
+    }
+    return 0;
+}
+
 static int cmd_info(const cli_args & a) {
     const std::string path = a.get("-m", "--model", "");
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
@@ -5094,6 +5225,8 @@ static void usage() {
         "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M]] [--seqs 1,2,4,8]\n"
         "                       [-c 512] [-n 32] [--check] [--text FILE] [--json F]\n"
         "                       one decode step of the layers for several sequences at once: what batching sessions gives\n"
+        "  agent-node bench-experts [--types iq2_xxs,iq3_xxs,q4_K+repack,...] [--threads 1,2,4,8] [--tokens 1,4] [--json F]\n"
+        "                       the experts of an MoE model in RAM on this CPU: speed by weight type and threads against the RAM\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
         "                       only the weights of the range (downloaded by HTTP ranges), with the metadata of the model\n"
         "  agent-node devices                                  the compute devices (JSON: name, type, memory)\n"
@@ -5226,6 +5359,9 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "bench-batch") {
             return cmd_bench_batch(a);
+        }
+        if (cmd == "bench-experts") {
+            return cmd_bench_experts(a);
         }
         usage();
         return 2;
