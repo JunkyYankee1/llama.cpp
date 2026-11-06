@@ -85,7 +85,7 @@ struct cli_args {
 
     static bool is_flag(const std::string & name) {
         return name == "--ignore-eos" || name == "--no-chat" || name == "--same-tokens" || name == "--tls" || name == "-v" || name == "--verbose" ||
-               name == "--vocab-only" || name == "--cpu-moe" || name == "--check" || name == "--lookup" || name == "--no-prefix-cache";
+               name == "--vocab-only" || name == "--cpu-moe" || name == "--check" || name == "--lookup" || name == "--no-prefix-cache" || name == "--profile";
     }
 
     cli_args(int argc, char ** argv, int first) {
@@ -117,7 +117,7 @@ struct cli_args {
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--ram-keep-pct", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
-            "--lookup", "--prefix-cache-mb", "--no-prefix-cache", "--types",
+            "--lookup", "--prefix-cache-mb", "--no-prefix-cache", "--types", "--profile",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -4701,6 +4701,65 @@ static std::string model_key(const std::string & path) {
 // several users (docs/Параллельные сессии.md). The inputs are random: the tokens of different users route to
 // different experts of an MoE model, as random hidden states do. --check also decodes each sequence alone and
 // compares the outputs: a batch must give what the sequences give one by one.
+// --profile of bench-batch: where the time of a step of the part goes. The scheduler calls the eval callback for every
+// node of a split before computing it and, with a callback set, synchronizes the backend after each split: the first
+// call of a split comes after the previous split is done and the inputs of this one are copied. So with the callback
+// never asking for data (pass "splits") the time from the first node of a split to the first node of the next one is
+// the compute of the split plus the copies into the next one, with no extra synchronization worth noting (the copies
+// from the GPU wait for it anyway). Pass "cpu" asks for every node on the CPU (one by one: the time of each operation,
+// with the cost of starting the threads per node); pass "gpu" the same on the GPU (a synchronization per node: the
+// shares of the operations, not their times).
+struct layer_profiler {
+    enum pass_t { OFF, SPLITS, CPU_OPS, GPU_OPS } pass = OFF;
+    struct ask {
+        double      t;
+        bool        cpu;
+        std::string name;
+    };
+    std::vector<ask>              asks;     // pass SPLITS: every node, in order
+    std::map<std::string, double> op_ms;    // passes CPU_OPS, GPU_OPS: per operation (the name without the layer)
+    std::map<std::string, int>    op_n;
+    double                        t_ask = 0;
+
+    static bool on_cpu(const ggml_tensor * t) {
+        return t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
+    }
+    // "ffn_moe_gate-12" -> "ffn_moe_gate (MUL_MAT_ID)"
+    static std::string op_key(const ggml_tensor * t) {
+        std::string n = t->name;
+        const size_t d = n.rfind('-');
+        if (d != std::string::npos && d + 1 < n.size() && std::all_of(n.begin() + d + 1, n.end(), ::isdigit)) {
+            n.resize(d);
+        }
+        return (n.empty() ? std::string("?") : n) + " (" + ggml_op_desc(t) + ")";
+    }
+    static bool cb(ggml_tensor * t, bool ask_, void * ud) {
+        auto * p = (layer_profiler *) ud;
+        const double now = now_ms();
+        if (p->pass == OFF) {
+            return ask_ ? false : true;
+        }
+        const bool cpu = on_cpu(t);
+        if (p->pass == SPLITS) {
+            if (ask_) {
+                p->asks.push_back({ now, cpu, t->name });
+            }
+            return ask_ ? false : true;
+        }
+        const bool want = p->pass == CPU_OPS ? cpu : !cpu;
+        if (ask_) {
+            if (want) {
+                p->t_ask = now;
+            }
+            return want;
+        }
+        const std::string k = op_key(t);
+        p->op_ms[k] += now - p->t_ask;
+        p->op_n[k]++;
+        return true;
+    }
+};
+
 static int cmd_bench_batch(const cli_args & a) {
     const model_opts mo = model_opts_from(a);
     std::vector<int> seqs;
@@ -4737,8 +4796,38 @@ static int cmd_bench_batch(const cli_args & a) {
     cp.n_threads       = n_threads;
     cp.n_threads_batch = n_threads;
     cp.no_perf         = true;
-    // to compare with --gpu-experts: a cache on the GPU for the experts in RAM (llama.cpp, experimental)
-    cp.moe_cache_size  = (size_t) a.get_int("--moe-cache-mib", "", 0) << 20;
+    // to compare with --gpu-experts: a cache on the GPU for the experts in RAM (llama.cpp); "auto": as the node sizes
+    // it — the free video memory after loading, less the node's headroom (10%, at least 512 MB), at most all experts
+    if (a.get("--moe-cache-mib", "", "") == "auto") {
+        uint64_t all = 0;
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        if (gguf_context * g = gguf_init_from_file(mo.path.c_str(), gp)) {
+            for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+                const std::string tn = gguf_get_tensor_name(g, i);
+                int l = -1;
+                if (tn.find("_exps") != std::string::npos && sscanf(tn.c_str(), "blk.%d.", &l) == 1 && l >= first && l < last) {
+                    all += gguf_get_tensor_size(g, i);
+                }
+            }
+            gguf_free(g);
+        }
+        uint64_t room = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                const uint64_t headroom = std::max<uint64_t>(total / 10, 512ull << 20);
+                room = free > headroom ? free - headroom : 0;
+                break;
+            }
+        }
+        cp.moe_cache_size = mo.cpu_moe && std::min(room, all) >= (64ull << 20) ? (size_t) std::min(room, all) : 0;
+        AN_LOG("bench-batch: expert cache on the GPU %.0f MiB (as the node: experts %.0f MiB, free video memory after the rest %.0f MiB)\n",
+            cp.moe_cache_size / 1048576.0, all / 1048576.0, room / 1048576.0);
+    } else {
+        cp.moe_cache_size = (size_t) a.get_int("--moe-cache-mib", "", 0) << 20;
+    }
     if (!is_last) {
         cp.embeddings   = true;
         cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -4874,10 +4963,147 @@ static int cmd_bench_batch(const cli_args & a) {
         rows.push_back(row);
         u0 += n;
     }
+
+    // --profile: where the time of a step goes (layer_profiler), for the first batch size, on a new context with the
+    // eval callback (the callback costs a synchronization per split: the measured context above runs without it)
+    json prof = nullptr;
+    if (a.has("--profile")) {
+        const int      pn = seqs[0];
+        layer_profiler P;
+        cp.cb_eval           = layer_profiler::cb;
+        cp.cb_eval_user_data = &P;
+        cp.n_ctx             = (uint32_t) (max_seq * (n_hist + 3 * n_steps + 16));
+        batch                = common_batch();
+        ctx.reset(); // its buffers and expert cache first
+        ctx.reset(llama_init_from_model(model.get(), cp));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the context for --profile");
+        }
+        batch = common_batch(ctx.get());
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        prefill(u0, pn, false);
+        int  pos  = 0;
+        auto step = [&](layer_profiler::pass_t pass, double & t0, double & t1) {
+            batch.clear();
+            for (int s = 0; s < pn; s++) {
+                add(u0 + s, n_hist + 2 + pos, s, true);
+            }
+            pos++;
+            P.pass = pass;
+            t0     = now_ms();
+            process();
+            t1     = now_ms();
+            P.pass = layer_profiler::OFF;
+        };
+        double t0, t1;
+        step(layer_profiler::OFF, t0, t1); // warm-up
+        step(layer_profiler::OFF, t0, t1);
+
+        // pass 1: the splits, in order. A split: the nodes on one backend between gaps in the calls
+        struct group { bool cpu; std::string first, last; int nodes; double ms; };
+        double wall = 0, prep = 0, ms_gpu = 0, ms_cpu = 0;
+        int    n_gpu = 0, n_cpu = 0;
+        std::vector<group> sample; // the splits of the middle step
+        for (int i = 0; i < n_steps; i++) {
+            P.asks.clear();
+            step(layer_profiler::SPLITS, t0, t1);
+            const auto & q = P.asks;
+            if (q.empty()) {
+                throw std::runtime_error("--profile: the eval callback was not called");
+            }
+            std::vector<group> gs;
+            size_t g0 = 0;
+            for (size_t k = 1; k <= q.size(); k++) {
+                if (k == q.size() || q[k].cpu != q[g0].cpu || q[k].t - q[k - 1].t > 0.015) {
+                    const double end = k == q.size() ? t1 : q[k].t;
+                    gs.push_back({ q[g0].cpu, q[g0].name, q[k - 1].name, (int) (k - g0), end - q[g0].t });
+                    g0 = k;
+                }
+            }
+            wall += t1 - t0;
+            prep += q[0].t - t0;
+            for (const auto & g : gs) {
+                (g.cpu ? ms_cpu : ms_gpu) += g.ms;
+                (g.cpu ? n_cpu : n_gpu) += 1;
+            }
+            if (i == n_steps / 2) {
+                sample = gs;
+            }
+        }
+        // passes 2 and 3: the operations on the CPU, then on the GPU
+        step(layer_profiler::CPU_OPS, t0, t1); // its first per-node step warms up differently
+        P.op_ms.clear();
+        P.op_n.clear();
+        double wall_cpu_ops = 0;
+        for (int i = 0; i < n_steps; i++) {
+            step(layer_profiler::CPU_OPS, t0, t1);
+            wall_cpu_ops += t1 - t0;
+        }
+        const auto cpu_ms = P.op_ms;
+        const auto cpu_n  = P.op_n;
+        P.op_ms.clear();
+        P.op_n.clear();
+        for (int i = 0; i < n_steps; i++) {
+            step(layer_profiler::GPU_OPS, t0, t1);
+        }
+        const auto gpu_ms = P.op_ms;
+        const auto gpu_n  = P.op_n;
+
+        const double ns = n_steps, base = rows.empty() ? 0 : (double) rows[0]["ms_per_step"];
+        printf("\nprofile: %d sequence%s, %d steps per pass, ms per step\n", pn, pn > 1 ? "s" : "", n_steps);
+        printf("  step                                  %8.2f  (without the profiler %.2f)\n", wall / ns, base);
+        printf("  preparing the step (graph, inputs)    %8.2f\n", prep / ns);
+        printf("  GPU, with the copies to the CPU       %8.2f  in %.1f splits\n", ms_gpu / ns, n_gpu / ns);
+        printf("  CPU                                   %8.2f  in %.1f splits (%.3f ms each)\n", ms_cpu / ns, n_cpu / ns,
+            n_cpu ? ms_cpu / n_cpu : 0.0);
+        printf("\n  the splits of a step (the middle one), the first 8 and the last 2:\n");
+        for (size_t k = 0; k < sample.size(); k++) {
+            if (k < 8 || k + 2 >= sample.size()) {
+                printf("    %-3s %8.3f ms  %3d nodes  %s .. %s\n", sample[k].cpu ? "CPU" : "GPU", sample[k].ms, sample[k].nodes,
+                    sample[k].first.c_str(), sample[k].last.c_str());
+            } else if (k == 8) {
+                printf("    ...\n");
+            }
+        }
+        auto table = [&](const std::string & title, const std::map<std::string, double> & ms, const std::map<std::string, int> & cnt) {
+            std::vector<std::pair<double, std::string>> v;
+            double sum = 0;
+            for (const auto & [k, x] : ms) {
+                v.push_back({ x, k });
+                sum += x;
+            }
+            std::sort(v.rbegin(), v.rend());
+            printf("\n  %s: %.2f ms per step\n", title.c_str(), sum / ns);
+            json arr = json::array();
+            for (size_t k = 0; k < v.size(); k++) {
+                const double per = v[k].first / ns;
+                const int    c   = cnt.at(v[k].second);
+                if (k < 14) {
+                    printf("    %-44s %8.3f ms  %5.1f%%  x%d\n", v[k].second.c_str(), per, sum > 0 ? 100 * v[k].first / sum : 0.0,
+                        (int) (c / ns + 0.5));
+                }
+                arr.push_back({ { "op", v[k].second }, { "ms_per_step", per }, { "per_step", c / ns } });
+            }
+            return arr;
+        };
+        char ttl[160];
+        snprintf(ttl, sizeof(ttl), "CPU operations one by one (pass 2; the step then takes %.2f ms)", wall_cpu_ops / ns);
+        json jc = table(ttl, cpu_ms, cpu_n);
+        json jg = table("GPU operations one by one (pass 3, a synchronization per operation: shares, not times)", gpu_ms, gpu_n);
+        json js = json::array();
+        for (const auto & g : sample) {
+            js.push_back({ { "cpu", g.cpu }, { "ms", g.ms }, { "nodes", g.nodes }, { "first", g.first }, { "last", g.last } });
+        }
+        prof = { { "seqs", pn }, { "steps", n_steps }, { "ms_per_step", wall / ns }, { "ms_per_step_plain", base },
+                 { "prep_ms", prep / ns }, { "gpu_ms", ms_gpu / ns }, { "gpu_splits", n_gpu / ns }, { "cpu_ms", ms_cpu / ns },
+                 { "cpu_splits", n_cpu / ns }, { "splits_of_a_step", js }, { "cpu_ops", jc }, { "gpu_ops", jg },
+                 { "ms_per_step_cpu_ops_pass", wall_cpu_ops / ns }, { "threads", n_threads },
+                 { "moe_cache_mib", (double) cp.moe_cache_size / 1048576.0 } };
+    }
     const std::string out = a.get("--json", "", "");
     if (!out.empty()) {
         std::ofstream(u8_path(out)) << json({ { "model", model_desc(model.get()) }, { "layer_start", first }, { "layer_end", last }, { "n_layer", n_layer },
-                                     { "ctx_per_seq", n_hist }, { "steps", n_steps }, { "cpu_moe", mo.cpu_moe }, { "rows", rows } })
+                                     { "ctx_per_seq", n_hist }, { "steps", n_steps }, { "cpu_moe", mo.cpu_moe }, { "rows", rows }, { "profile", prof } })
                                    .dump(1)
                                << "\n";
     }
@@ -5252,9 +5478,10 @@ static void usage() {
         "                       how many proposed tokens would be accepted on the text of a dump, without a chain\n"
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
-        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M]] [--seqs 1,2,4,8]\n"
-        "                       [-c 512] [-n 32] [--check] [--text FILE] [--json F]\n"
-        "                       one decode step of the layers for several sequences at once: what batching sessions gives\n"
+        "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M|auto]] [--seqs 1,2,4,8]\n"
+        "                       [-c 512] [-n 32] [--check] [--profile] [--text FILE] [--json F]\n"
+        "                       one decode step of the layers for several sequences at once: what batching sessions gives;\n"
+        "                       --profile: where the time of a step goes (GPU, CPU, the operations), for the first --seqs\n"
         "  agent-node bench-experts [--types iq2_xxs,iq3_xxs,q4_K+repack,...] [--threads 1,2,4,8] [--tokens 1,4] [--json F]\n"
         "                       the experts of an MoE model in RAM on this CPU: speed by weight type and threads against the RAM\n"
         "  agent-node slice     --from URL|model.gguf (--layers START:END | --vocab-only) --out slice.gguf [--mirror URL]\n"
