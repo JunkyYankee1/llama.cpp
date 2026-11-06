@@ -4924,11 +4924,18 @@ static int cmd_bench_experts(const cli_args & a) {
         tokens.push_back(std::max(1, std::stoi(x)));
     }
     // the formats of the experts of the Qwen GGUF files: 1-2 bits for the biggest models, 3-4 for the smaller ones
-    const std::string def = "q1_0,iq1_m,iq2_xxs,iq2_xs,q2_K,iq3_xxs,iq3_s,q3_K,iq4_xs,q4_K,q4_K+repack,q4_0+repack,iq4_nl+repack";
+    // with the AVX-512 kernels of IQ2_XXS and IQ3_XXS in the loaded CPU backend (feature IQ512): also the stock ones
+    ggml_log_set(log_callback, nullptr); // the CPU backend logs every repacked tensor
+    runner            R;
+    const std::string feat  = backend_features(ggml_backend_dev_backend_reg(R.dev));
+    const bool        iq512 = (" " + feat + " ").find(" IQ512 ") != std::string::npos && R.set_iq512;
+    const std::string def   = std::string("q1_0,iq1_m,iq2_xxs,") + (iq512 ? "iq2_xxs-ggml," : "") + "iq2_xs,q2_K,iq3_xxs," +
+                            (iq512 ? "iq3_xxs-ggml," : "") + "iq3_s,q3_K,iq4_xs,q4_K,q4_K+repack,q4_0+repack,iq4_nl+repack";
     std::vector<variant> vs;
     for (const auto & name : split_list(a.get("--types", "", def))) {
+        const bool        st   = name.size() > 5 && name.compare(name.size() - 5, 5, "-ggml") == 0;
         const bool        rp   = name.size() > 7 && name.compare(name.size() - 7, 7, "+repack") == 0;
-        const std::string base = rp ? name.substr(0, name.size() - 7) : name;
+        const std::string base = rp ? name.substr(0, name.size() - 7) : st ? name.substr(0, name.size() - 5) : name;
         int               found = -1;
         for (int t = 0; t < GGML_TYPE_COUNT; t++) {
             const char * tn = ggml_type_name((ggml_type) t);
@@ -4942,17 +4949,20 @@ static int cmd_bench_experts(const cli_args & a) {
         if (rp && found != GGML_TYPE_Q4_0 && found != GGML_TYPE_Q4_K && found != GGML_TYPE_IQ4_NL) {
             throw std::runtime_error("bench-experts: the CPU repacks only q4_0, q4_K and iq4_nl");
         }
-        vs.push_back({ (ggml_type) found, rp });
+        if (st && found != GGML_TYPE_IQ2_XXS && found != GGML_TYPE_IQ3_XXS) {
+            throw std::runtime_error("bench-experts: -ggml is only for iq2_xxs and iq3_xxs");
+        }
+        vs.push_back({ (ggml_type) found, rp, st });
     }
 
-    ggml_log_set(log_callback, nullptr); // the CPU backend logs every repacked tensor
-    runner R;
     const cpu_flags f = detect_cpu();
     printf("CPU: %s, %d threads\n", ggml_backend_dev_description(R.dev), n_hw);
     printf("instructions of the CPU: %s%s%s%s%s%s\n", f.avx2 ? "AVX2" : "no AVX2", f.avx_vnni ? " AVX-VNNI" : "", f.avx512f ? " AVX-512" : "",
         f.avx512_vnni ? " VNNI-512" : "", f.avx512_vbmi ? " VBMI" : "", f.avx512_bf16 ? " BF16-512" : "");
-    const std::string feat = backend_features(ggml_backend_dev_backend_reg(R.dev));
     printf("the CPU backend is built for: %s\n", feat.empty() ? "?" : feat.c_str());
+    if (iq512) {
+        printf("IQ512: iq2_xxs and iq3_xxs with the AVX-512 kernels of this build; the -ggml rows: the stock kernels\n");
+    }
     if (!R.repack) {
         printf("no CPU_REPACK buffer in this build: the +repack rows are skipped\n");
     }
@@ -4970,7 +4980,9 @@ static int cmd_bench_experts(const cli_args & a) {
     buf.shrink_to_fit();
 
     json rows = json::array();
+    json checks = json::array();
     for (int nt : tokens) {
+        std::map<std::string, std::vector<float>> outs; // type -> the output, to check the AVX-512 kernels against ggml
         printf("\nexpert block of one layer of Qwen3.5-35B-A3B, %d token%s: GB/s of weights processed by threads (more is better)\n", nt, nt > 1 ? "s" : "");
         printf("%-14s %5s", "type", "bits");
         for (int t : threads) {
@@ -4994,7 +5006,25 @@ static int cmd_bench_experts(const cli_args & a) {
                 rows.push_back({ { "type", r.name }, { "bpw", r.bpw }, { "threads", r.threads }, { "tokens", r.tokens },
                                  { "us_per_layer", r.us_per_layer }, { "weight_gbps", r.weight_gbps } });
             }
-            printf("  %8.0f\n", res.back().us_per_layer);
+            printf("  %8.0f", res.back().us_per_layer);
+            // -ggml after its type: the outputs of the two kernels (the same inputs) must agree up to rounding
+            const std::string base = ggml_type_name(v.type);
+            if (v.stock && outs.count(base)) {
+                const auto & a = outs[base];
+                const auto & b = res[0].out;
+                double num = 0, den = 0;
+                for (size_t i = 0; i < a.size() && i < b.size(); i++) {
+                    num = std::max(num, (double) fabsf(a[i] - b[i]));
+                    den = std::max(den, (double) fabsf(b[i]));
+                }
+                const double rel = den > 0 ? num / den : 1;
+                const bool   ok  = a.size() == b.size() && rel < 1e-2; // a wrong kernel: differences of the order of the output
+                printf("   %s: max difference %.1e of the largest output", ok ? "same result as ggml" : "WRONG RESULT", rel);
+                checks.push_back({ { "type", base }, { "tokens", nt }, { "max_rel_diff", rel }, { "ok", ok } });
+            } else if (!v.stock && !v.repack) {
+                outs[base] = res[0].out;
+            }
+            printf("\n");
             fflush(stdout);
         }
     }
@@ -5007,7 +5037,7 @@ static int cmd_bench_experts(const cli_args & a) {
         }
         std::ofstream(u8_path(out)) << json({ { "cpu", ggml_backend_dev_description(R.dev) }, { "hw_threads", n_hw },
                                               { "avx2", f.avx2 }, { "avx512", f.avx512f }, { "avx512_vnni", f.avx512_vnni }, { "avx512_vbmi", f.avx512_vbmi },
-                                              { "avx_vnni", f.avx_vnni }, { "backend_features", feat }, { "ram", jr }, { "rows", rows } })
+                                              { "avx_vnni", f.avx_vnni }, { "backend_features", feat }, { "ram", jr }, { "rows", rows }, { "iq512_checks", checks } })
                                            .dump(1)
                                     << "\n";
     }
