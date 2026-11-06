@@ -116,7 +116,7 @@ struct cli_args {
             "--keep-warm", "--keep-warm-mb", "--gpu-clocks",
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--ram-keep-pct", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
-            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
+            "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--moe-cache-keep-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
             "--lookup", "--prefix-cache-mb", "--no-prefix-cache", "--types", "--profile",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
@@ -191,7 +191,10 @@ struct model_opts {
     // 4 sessions get 2.3 times the tokens per second of all experts on the CPU, 10 layers of experts on the GPU 1.4 times
     uint64_t    moe_cache_bytes = 0;
     // the cache took what the video memory had left (no --moe-cache-mib): make_node_part may cut it for the sessions
+    // or grow it into the memory the sessions leave
     bool        moe_cache_auto  = false;
+    uint64_t    moe_cache_max   = 0;       // all experts of the part: a bigger cache is of no use
+    uint64_t    moe_cache_keep  = 1ull << 30; // free video memory the grown cache leaves (--moe-cache-keep-mb)
 };
 
 // the number of layers from the metadata of a GGUF file, without loading it
@@ -1390,7 +1393,9 @@ struct node_server {
 // a quick measurement of the speed of this node for the coordinator: single-token forwards through the layers of the part,
 // as in generation; returns milliseconds per layer per token
 static double measure_ms_per_layer(const llama_model * model, const model_opts & mo, int32_t n_threads) {
-    model_part p(model, mo, 64, n_threads);
+    // with the expert cache, as the sessions will run: without it the experts in RAM run on the CPU, and the node
+    // looked 1.6 times slower than it is (1.03 ms per layer instead of ~0.64, docs/НИОКР ускорение узла.md)
+    model_part p(model, mo, 64, n_threads, 0, 1, mo.moe_cache_bytes);
     std::vector<float> in((size_t) p.n_embd, 0.01f), hidden;
     std::vector<top_entry> top;
     uint32_t n_out = 0;
@@ -1447,8 +1452,22 @@ static std::unique_ptr<model_part> make_node_part(const llama_model * model, mod
             mo.moe_cache_bytes -= cut;
             base -= cut;
             n = (uint32_t) std::clamp<int64_t>((f0 - (int64_t) margin - base) / per, 1, want);
+        } else if (mo.moe_cache_auto && mo.moe_cache_bytes < mo.moe_cache_max) {
+            // all sessions fit: the memory they leave beyond --moe-cache-keep-mb goes to the cache. The first guess of
+            // the cache (prepare_assigned_slice) keeps a headroom and counts the token embeddings, which stay in RAM, and
+            // left ~1.3 GB of an 8 GB card unused; with 4 sessions every 1 GB of cache gives ~1.4 times the tokens per
+            // second up to ~4.5 GB (docs/НИОКР ускорение узла.md)
+            const int64_t keep = std::max<int64_t>((int64_t) mo.moe_cache_keep, (int64_t) margin);
+            int64_t add = f0 - keep - base - (int64_t) want * per;
+            add = std::min<int64_t>(add, (int64_t) (mo.moe_cache_max - mo.moe_cache_bytes)) & ~((int64_t) (1 << 20) - 1);
+            if (add >= (64 << 20)) {
+                AN_LOG("node: the sessions leave room, the expert cache %.0f -> %.0f MiB (%.0f MiB stay free)\n",
+                    mo.moe_cache_bytes / 1048576.0, (mo.moe_cache_bytes + add) / 1048576.0, keep / 1048576.0);
+                mo.moe_cache_bytes += add;
+                base += add;
+            }
         }
-        AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the context %.0f MiB more: %u of %u sessions fit with %.0f MiB to spare\n",
+        AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the expert cache and compute buffers %.0f MiB: %u of %u sessions fit with %.0f MiB to spare\n",
             f0 / 1048576.0, per / 1048576.0, std::max<int64_t>(base, 0) / 1048576.0, n, want, margin / 1048576.0);
     }
     return std::make_unique<model_part>(model, mo, n * n_ctx, n_threads, n_rollback, n, mo.moe_cache_bytes);
@@ -1730,6 +1749,12 @@ static uint64_t prepare_assigned_slice(const cli_args & a, model_opts & mo, cons
                 mo.moe_cache_bytes = 0;
             }
             mo.moe_cache_auto = !a.has("--moe-cache-mib") && mo.moe_cache_bytes > 0;
+            // the cache grows into what the sessions leave (make_node_part), but not past a limit the owner set, and it
+            // leaves the reserve minus the CUDA context (~0.45 GB, already taken when the free memory is measured): the
+            // reserve also holds the draft model of the app (--vram-reserve-mb 2560 with it, 1536 without)
+            mo.moe_cache_max  = a.has("--vram-gb") ? mo.moe_cache_bytes : all;
+            mo.moe_cache_keep = (uint64_t) std::max(a.get_int("--moe-cache-keep-mb", "",
+                std::max(a.get_int("--vram-reserve-mb", "", 1024) - 512, 512)), 0) << 20;
             gpu_experts = mo.moe_cache_bytes;
             AN_LOG("node: the experts in RAM (%s), a cache of %s of them on the GPU\n", fmt_gb(all).c_str(), fmt_gb(gpu_experts).c_str());
         }
@@ -5496,6 +5521,8 @@ static void usage() {
         "          client [--tls] [--keys K,K,.. | --tokens T,T,.. --session HEX] [--pins FP,FP,..]\n"
         "failover: client --spare HOST:PORT,.. [--spare-keys ..] [--spare-pins ..] [--timeout 3000]\n"
         "sessions: node [--max-sessions 4] [--seq-ctx 16384] [--seq-rollback 6] [--vram-margin-mb 256] [--batch-max N] [--batch-wait-ms 20]\n"
+        "               [--moe-cache-keep-mb N]: the automatic expert cache grows into the memory the sessions leave, N MB stay free\n"
+        "               (default: --vram-reserve-mb minus 512; it does not grow with --vram-gb)\n"
         "               one context for the sessions, fewer if the GPU memory runs short; the forwards waiting at the moment\n"
         "               run in one pass (--batch-max 1: one at a time)\n"
         "               [--prefix-cache-mb 512]  the states after the shared starts of prompts (the system message of the\n"

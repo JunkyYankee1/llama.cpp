@@ -81,7 +81,10 @@ video memory left after the rest of the slice (minus the headroom the coordinato
 the expert cache of llama.cpp (`--moe-cache-mib M` to set it): of the 256 experts of a layer 8 work per token and the
 same ones are needed often, the cache keeps them on the GPU. `--gpu-experts N` instead keeps the experts of the last
 N layers there. bench-batch, layers 0:24, 4 sessions: all experts on the CPU 74 tokens/s, 10 layers of experts on the
-GPU 103, a cache of 3 GB 172. The status tells `moe_cache_mb` and `gpu_expert_layers`.
+GPU 103, a cache of 3 GB 172. Once the sessions are measured, the automatic cache takes the memory they leave too,
+keeping `--moe-cache-keep-mb` free (default: `--vram-reserve-mb` minus 512, the CUDA context is already taken by then;
+not with `--vram-gb`); the speed the node reports to the coordinator is measured with the cache.
+The status tells `moe_cache_mb` and `gpu_expert_layers`.
 
 A forward with `FORWARD_CHECKPOINT` makes every node keep the state of the session after it (the recurrent layers;
 4 per session, the oldest goes first); a later forward may start at that position again. `serve` keeps the chain of
