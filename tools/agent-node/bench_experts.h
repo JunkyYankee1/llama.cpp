@@ -108,12 +108,14 @@ static double ram_gbps(const std::vector<uint64_t> & buf, int n) {
 struct variant {
     ggml_type type;
     bool      repack; // weights in the CPU_REPACK buffer type (Q4_0, Q4_K, IQ4_NL on AVX2), which --cpu-moe skips
+    bool      stock = false; // IQ2_XXS, IQ3_XXS: the stock ggml kernel instead of the AVX-512 one (CPU feature IQ512)
 };
 
 struct result {
     std::string name;
     int         threads, tokens;
     double      us_per_layer, weight_gbps, bpw;
+    std::vector<float> out; // the output of the block (first set of experts), in the first result of each token count
 };
 
 struct runner {
@@ -121,6 +123,7 @@ struct runner {
     ggml_backend_t             be;
     ggml_backend_buffer_type_t repack = nullptr;
     void (*set_threads)(ggml_backend_t, int) = nullptr;
+    void (*set_iq512)(int)                   = nullptr; // only in builds with the AVX-512 kernels
 
     runner() {
         dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -130,6 +133,7 @@ struct runner {
         be = ggml_backend_dev_init(dev, nullptr);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         set_threads = (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        set_iq512 = (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_iq512");
         typedef ggml_backend_buffer_type_t * (*extra_t)(ggml_backend_dev_t);
         auto extra = (extra_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
         for (ggml_backend_buffer_type_t * b = extra ? extra(dev) : nullptr; b && *b; b++) {
@@ -143,6 +147,9 @@ struct runner {
     // the expert block of one layer: microseconds per step for each (threads, tokens), the weights quantized once
     std::vector<result> run(const variant & v, const std::vector<int> & threads, const std::vector<int> & tokens, double secs) {
         const int64_t n_embd = 2048, n_ff = 512, n_exp = 256, n_used = 8, n_set = 32;
+        if (set_iq512) {
+            set_iq512(v.stock ? 0 : 1);
+        }
         std::mt19937  rng(1);
         ggml_quantize_init(v.type);
         ggml_init_params wp = { ggml_tensor_overhead() * 4, nullptr, true };
@@ -208,6 +215,7 @@ struct runner {
                 }
                 ggml_backend_tensor_set(ids, iv.data(), 0, iv.size() * sizeof(int32_t));
             }
+            const size_t first = out.size();
             for (int th : threads) {
                 if (set_threads) {
                     set_threads(be, th);
@@ -225,7 +233,7 @@ struct runner {
                 } while (el < secs);
                 const double us = el / reps * 1e6;
                 result r;
-                r.name         = std::string(ggml_type_name(v.type)) + (v.repack ? "+repack" : "");
+                r.name         = std::string(ggml_type_name(v.type)) + (v.repack ? "+repack" : "") + (v.stock ? "-ggml" : "");
                 r.threads      = th;
                 r.tokens       = nt;
                 r.us_per_layer = us;
@@ -233,11 +241,19 @@ struct runner {
                 r.bpw          = 8.0 * ggml_row_size(v.type, n_embd) / n_embd;
                 out.push_back(r);
             }
+            // the result itself, to compare kernels (the same seed: the same weights, activations and experts)
+            ggml_backend_graph_compute(be, gfs[0]);
+            ggml_tensor * res = ggml_graph_node(gfs[0], -1);
+            out[first].out.resize(ggml_nelements(res));
+            ggml_backend_tensor_get(res, out[first].out.data(), 0, ggml_nbytes(res));
             ggml_backend_buffer_free(ab);
             ggml_free(gctx);
         }
         ggml_backend_buffer_free(wb);
         ggml_free(wctx);
+        if (set_iq512) {
+            set_iq512(1);
+        }
         return out;
     }
 };

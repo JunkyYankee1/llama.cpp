@@ -107,10 +107,12 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_AVX2=ON ^
+          rem как в выпуске: процессорная часть — DLL по варианту на набор команд (GGML_CPU_ALL_VARIANTS);
+          rem здесь — AVX2 (haswell) и AVX-512 VBMI + VNNI (icelake, с ядрами arch/x86/iq-avx512.h)
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON ^
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_BORINGSSL=ON
           if errorlevel 1 exit /b 1
-          cmake --build build -j %NUMBER_OF_PROCESSORS% --target agent-node
+          cmake --build build -j %NUMBER_OF_PROCESSORS% --target agent-node ggml-cpu-haswell ggml-cpu-icelake
           if errorlevel 1 exit /b 1
 
       - name: Запуск
@@ -121,3 +123,14 @@ jobs:
           if ($out -notmatch 'usage:') { Write-Host $out; exit 1 }
           Write-Host 'agent-node.exe запускается'
           exit 0 # код выхода справки — не ошибка шага
+
+      # ядра AVX-512 IQ2_XXS / IQ3_XXS против ядер ggml, если у сборщика AVX-512 VBMI + VNNI (иначе — вариант haswell)
+      - name: Ядра IQ на процессоре сборщика
+        shell: pwsh
+        run: |
+          $out = & build\bin\agent-node.exe bench-experts --threads 1,2 --tokens 1 --types iq2_xxs,iq2_xxs-ggml,iq3_xxs,iq3_xxs-ggml 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          "``````n$out``````" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($rc -ne 0) { throw "bench-experts: код $rc" }
+          if ($out -match 'WRONG RESULT') { throw 'ядро AVX-512 считает не так, как ggml' }

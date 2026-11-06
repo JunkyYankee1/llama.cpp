@@ -532,6 +532,10 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
+// the AVX-512 VBMI + VNNI kernels of IQ2_XXS and IQ3_XXS (arch/x86/iq-avx512.h) where the build has them;
+// 0: the stock kernels (to compare them on one PC: agent-node bench-experts)
+extern int ggml_cpu_iq512;
+
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 

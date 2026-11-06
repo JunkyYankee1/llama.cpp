@@ -14,6 +14,11 @@
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+#define GGML_CPU_IQ512
+#include "iq-avx512.h"
+#endif
+
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
 #define GROUP_MAX_EPS_IQ2_S 1e-8f
@@ -2734,6 +2739,13 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     const int nb = n / QK_K;
 
+#if defined(GGML_CPU_IQ512)
+    if (ggml_cpu_iq512) {
+        iq512_dot_iq2_xxs(n, s, x, y);
+        return;
+    }
+#endif
+
 #if defined(__AVX2__)
 
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
@@ -3333,6 +3345,13 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
     const block_q8_K    * GGML_RESTRICT y = vy;
 
     const int nb = n / QK_K;
+
+#if defined(GGML_CPU_IQ512)
+    if (ggml_cpu_iq512) {
+        iq512_dot_iq3_xxs(n, s, x, y);
+        return;
+    }
+#endif
 
 #if defined(__AVX2__)
 

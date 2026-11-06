@@ -644,6 +644,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     #ifdef GGML_USE_CPU_REPACK
         features.push_back({ "REPACK", "1" });
     #endif
+    #if defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+        features.push_back({ "IQ512", "1" }); // arch/x86/iq-avx512.h
+    #endif
 
         features.push_back({ nullptr, nullptr });
 
@@ -653,6 +656,11 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     return features.data();
 
     GGML_UNUSED(reg);
+}
+
+// on / off the AVX-512 kernels of IQ2_XXS and IQ3_XXS (ggml_cpu_iq512)
+static void ggml_backend_cpu_set_iq512(int on) {
+    ggml_cpu_iq512 = on;
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -666,6 +674,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cpu_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_iq512") == 0) {
+        return (void *)ggml_backend_cpu_set_iq512;
     }
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_cpu_set_abort_callback;
