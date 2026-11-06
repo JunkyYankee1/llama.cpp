@@ -117,7 +117,7 @@ struct cli_args {
             "--account", "--parent-pid", "--chat-template", "--test-corrupt", "--verifier-token", "--bind-host", "--p2p", "--rendezvous", "--secret", "--bytes", "--every", "--rounds",
             "--listen-host", "--listen-port", "--relay", "--cpu-moe", "--ram-gb", "--ram-keep-pct", "--from", "--out", "--vocab-only", "--model-url", "--models-dir", "--disk-gb", "--vram-gb", "--vram-reserve-mb", "--mirror", "--seqs", "--check",
             "--max-sessions", "--seq-ctx", "--seq-rollback", "--vram-margin-mb", "--moe-cache-keep-mb", "--batch-max", "--batch-wait-ms", "--keep-chain-s", "--gpu-experts", "--moe-cache-mib", "--text",
-            "--lookup", "--prefix-cache-mb", "--no-prefix-cache", "--types", "--profile",
+            "--lookup", "--prefix-cache-mb", "--no-prefix-cache", "--types", "--profile", "--load-mode",
             "-c", "-dev", "-f", "-m", "-n", "-ngl", "-ngld", "-p", "-t", "-v",
         };
         for (const auto & kv : opts) {
@@ -195,7 +195,19 @@ struct model_opts {
     bool        moe_cache_auto  = false;
     uint64_t    moe_cache_max   = 0;       // all experts of the part: a bigger cache is of no use
     uint64_t    moe_cache_keep  = 1ull << 30; // free video memory the grown cache leaves (--moe-cache-keep-mb)
+    // --load-mode none|mmap|mlock|mmap+mlock|dio (empty: llama.cpp's default). With --cpu-moe the experts are read
+    // from the mapped file; llama.cpp suggests none for overrides to the CPU (to be measured: bench-batch.ps1 -LoadMode)
+    std::string load_mode;
 };
+
+static llama_load_mode parse_load_mode(const std::string & s) {
+    for (const char * m : { "none", "mmap", "mlock", "mmap+mlock", "dio" }) {
+        if (s == m) {
+            return llama_load_mode_from_str(m);
+        }
+    }
+    throw std::runtime_error("--load-mode must be none, mmap, mlock, mmap+mlock or dio");
+}
 
 // the number of layers from the metadata of a GGUF file, without loading it
 static int32_t gguf_n_layer(const std::string & path) {
@@ -222,6 +234,9 @@ static llama_model_ptr load_model(const model_opts & mo) {
     mp.layer_start  = mo.layer_start;
     mp.layer_end    = mo.layer_end;
     mp.vocab_only   = mo.vocab_only;
+    if (!mo.load_mode.empty()) {
+        mp.load_mode = parse_load_mode(mo.load_mode);
+    }
 
     // the experts take most of an MoE layer and only a few of them work per token: in RAM a node holds more layers.
     // The experts of the last gpu_expert_layers layers stay on the GPU; the patterns live until the model is loaded
@@ -274,6 +289,7 @@ static model_opts model_opts_from(const cli_args & a) {
     mo.n_gpu_layers = a.get_int("-ngl", "--n-gpu-layers", 999);
     mo.device       = a.get("--device", "-dev", "");
     mo.cpu_moe      = a.has("--cpu-moe");
+    mo.load_mode    = a.get("--load-mode", "", "");
     mo.gpu_expert_layers = a.get_int("--gpu-experts", "", 0);
     // "auto" (bench-batch): the command sizes the cache itself
     mo.moe_cache_bytes   = mo.cpu_moe && a.get("--moe-cache-mib", "", "") != "auto" ? (uint64_t) a.get_int("--moe-cache-mib", "", 0) << 20 : 0;
@@ -2038,6 +2054,7 @@ static int cmd_node(const cli_args & a) {
         srv.mo.n_gpu_layers = a.get_int("-ngl", "--n-gpu-layers", 999);
         srv.mo.device       = a.get("--device", "-dev", "");
         srv.mo.cpu_moe      = a.has("--cpu-moe");
+        srv.mo.load_mode    = a.get("--load-mode", "", "");
     } else {
         srv.mo = model_opts_from(a);
     }
@@ -5505,7 +5522,7 @@ static void usage() {
         "  agent-node compare   CHAIN_DUMP REFERENCE_DUMP [--tokens 128] [--tol 0.03] [--top1 0.95] [--same-tokens]\n"
         "  agent-node info      -m model.gguf\n"
         "  agent-node bench-batch -m model.gguf [--layers START:END] [--cpu-moe [--gpu-experts N | --moe-cache-mib M|auto]] [--seqs 1,2,4,8]\n"
-        "                       [-c 512] [-n 32] [--check] [--profile] [--text FILE] [--json F]\n"
+        "                       [-c 512] [-n 32] [--check] [--profile] [--text FILE] [--json F] [--load-mode none|mmap|mlock|...]\n"
         "                       one decode step of the layers for several sequences at once: what batching sessions gives;\n"
         "                       --profile: where the time of a step goes (GPU, CPU, the operations), for the first --seqs\n"
         "  agent-node bench-experts [--types iq2_xxs,iq3_xxs,q4_K+repack,...] [--threads 1,2,4,8] [--tokens 1,4] [--json F]\n"
