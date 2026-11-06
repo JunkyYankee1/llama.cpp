@@ -272,7 +272,8 @@ static model_opts model_opts_from(const cli_args & a) {
     mo.device       = a.get("--device", "-dev", "");
     mo.cpu_moe      = a.has("--cpu-moe");
     mo.gpu_expert_layers = a.get_int("--gpu-experts", "", 0);
-    mo.moe_cache_bytes   = mo.cpu_moe ? (uint64_t) a.get_int("--moe-cache-mib", "", 0) << 20 : 0;
+    // "auto" (bench-batch): the command sizes the cache itself
+    mo.moe_cache_bytes   = mo.cpu_moe && a.get("--moe-cache-mib", "", "") != "auto" ? (uint64_t) a.get_int("--moe-cache-mib", "", 0) << 20 : 0;
     const std::string layers = a.get("--layers", "", "");
     if (!layers.empty()) {
         const size_t p = layers.find(':');
