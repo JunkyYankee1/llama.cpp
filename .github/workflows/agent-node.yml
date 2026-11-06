@@ -134,3 +134,5 @@ jobs:
           "``````n$out``````" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           if ($rc -ne 0) { throw "bench-experts: код $rc" }
           if ($out -match 'WRONG RESULT') { throw 'ядро AVX-512 считает не так, как ggml' }
+          # процессор с VBMI и VNNI, а загружен вариант без ядер IQ512 — ошибка выбора варианта
+          if ($out -match 'instructions of the CPU:.*VNNI-512 VBMI' -and $out -notmatch 'built for:.* IQ512') { throw 'у процессора есть AVX-512 VBMI + VNNI, а ядра IQ512 не загрузились' }
