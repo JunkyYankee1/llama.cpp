@@ -195,8 +195,10 @@ struct model_opts {
     bool        moe_cache_auto  = false;
     uint64_t    moe_cache_max   = 0;       // all experts of the part: a bigger cache is of no use
     uint64_t    moe_cache_keep  = 1ull << 30; // free video memory the grown cache leaves (--moe-cache-keep-mb)
-    // --load-mode none|mmap|mlock|mmap+mlock|dio (empty: llama.cpp's default). With --cpu-moe the experts are read
-    // from the mapped file; llama.cpp suggests none for overrides to the CPU (to be measured: bench-batch.ps1 -LoadMode)
+    // --load-mode none|mmap|mlock|mmap+mlock|dio. Empty: none with --cpu-moe, llama.cpp's default (mmap) otherwise.
+    // Experts read from the mapped file made a part 1.6 times slower on 1 session and 1.9 times on 4 (RTX 5060 Ti,
+    // Windows, layers 0:24 of the 35B with a 2830 MiB expert cache: 16.9 -> 10.7 and 44.2 -> 23.0 ms per step;
+    // docs/НИОКР ускорение узла.md). The RAM is the same: the node counts the experts in RAM in either mode
     std::string load_mode;
 };
 
@@ -236,6 +238,8 @@ static llama_model_ptr load_model(const model_opts & mo) {
     mp.vocab_only   = mo.vocab_only;
     if (!mo.load_mode.empty()) {
         mp.load_mode = parse_load_mode(mo.load_mode);
+    } else if (mo.cpu_moe && !mo.vocab_only) {
+        mp.load_mode = parse_load_mode("none");
     }
 
     // the experts take most of an MoE layer and only a few of them work per token: in RAM a node holds more layers.
