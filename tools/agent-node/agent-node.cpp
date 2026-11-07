@@ -38,6 +38,7 @@
 #include "gguf.h"
 #include "llama-cpp.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_get_memory_breakdown: the probe counts its own buffers
 
 #include <algorithm>
 #include <cctype>
@@ -1435,9 +1436,26 @@ static double measure_ms_per_layer(const llama_model * model, const model_opts &
     return (now_ms() - t0) / n_run / std::max(1, p.last - p.first);
 }
 
+// bytes of a context in the memory of the video card `dev`: the KV cache, the recurrent states, the expert cache and the
+// compute buffers (the weights are loaded once for all contexts and are not counted)
+static int64_t context_device_bytes(const llama_context * ctx, ggml_backend_dev_t dev) {
+    int64_t n = 0;
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        if (!ggml_backend_buft_is_host(buft) && ggml_backend_buft_get_device(buft) == dev) {
+            n += (int64_t) (mb.context + mb.compute);
+        }
+    }
+    return n;
+}
+
 // the context of a node for up to `want` sessions of n_ctx tokens each: on a GPU fewer, if the memory of the video card
 // would not hold them with `margin` bytes to spare (beyond it the driver moves weights to shared memory, bench/RESULTS.md).
 // The memory per session (KV cache, DeltaNet states with their rollback snapshots) is measured with contexts for 1 and 2
+// sessions by the sizes of their own buffers, not by the free memory of the card: other programs load at the same time
+// (the app's `serve` with the 0.8B draft model), and the free memory counted them as the node's - the expert cache came
+// out ~2.3 GB bigger than it is and shrank 2518 -> 2063 MiB; with the draft model off it was right (docs/НИОКР ускорение
+// узла.md). The free memory still gives what the card leaves beyond the buffers (CUDA streams, cuBLAS: ~0.4 GB), up to
+// `max_other`, and how much is free: the smaller of before and after the probes.
 // The automatic expert cache gives way to the sessions, down to half of it: a session is a user served, and 4 sessions
 // in one pass give more tokens per second than 2 with a bigger cache (docs/Параллельные сессии.md)
 static std::unique_ptr<model_part> make_node_part(const llama_model * model, model_opts & mo, int32_t n_threads,
@@ -1451,34 +1469,46 @@ static std::unique_ptr<model_part> make_node_part(const llama_model * model, mod
             ggml_backend_dev_memory(dev, &free, &total);
             return (int64_t) free;
         };
+        const int64_t max_other = 768ll << 20;
         const int64_t f0 = free_mem();
-        int64_t f1, f2;
+        int64_t f1, f2, own1, own2;
         {
             model_part p(model, mo, n_ctx, n_threads, n_rollback, 1, mo.moe_cache_bytes);
-            f1 = free_mem();
+            f1   = free_mem();
+            own1 = context_device_bytes(p.ctx.get(), dev);
         }
         {
             model_part p(model, mo, 2 * n_ctx, n_threads, n_rollback, 2, mo.moe_cache_bytes);
-            f2 = free_mem();
+            f2   = free_mem();
+            own2 = context_device_bytes(p.ctx.get(), dev);
         }
-        const int64_t per  = std::max<int64_t>(f1 - f2, 1);
-        int64_t base = f0 - f1 - per; // compute buffers and the expert cache
-        n = (uint32_t) std::clamp<int64_t>((f0 - (int64_t) margin - base) / per, 1, want);
+        const int64_t f_end = free_mem();
+        // beyond the buffers: the smaller of the two probes, the other one may have caught a program loading
+        const int64_t seen  = std::min(f0 - f1 - own1, f0 - f2 - own2);
+        const int64_t other = std::clamp<int64_t>(seen, 0, max_other);
+        const int64_t avail = std::min(f0, f_end);
+        if (seen > max_other || f0 - f_end > (64ll << 20)) {
+            AN_LOG("node: other programs took video memory during the probe: %.0f MiB beyond the node's buffers, %.0f MiB less free after it; counted by the buffers\n",
+                std::max<int64_t>(f0 - f1 - own1, f0 - f2 - own2) / 1048576.0, (f0 - f_end) / 1048576.0);
+        }
+        const int64_t per  = std::max<int64_t>(own2 - own1, 1);
+        int64_t base = own1 - per + other; // compute buffers, the expert cache and what the card takes beyond them
+        n = (uint32_t) std::clamp<int64_t>((avail - (int64_t) margin - base) / per, 1, want);
         if (n < want && mo.moe_cache_auto) {
-            const int64_t short_by = (int64_t) want * per + base + (int64_t) margin - f0;
+            const int64_t short_by = (int64_t) want * per + base + (int64_t) margin - avail;
             const int64_t cut = std::min<int64_t>((short_by + (1 << 20) - 1) & ~((int64_t) (1 << 20) - 1), (int64_t) mo.moe_cache_bytes / 2);
             AN_LOG("node: %u of %u sessions fit, the expert cache %.0f -> %.0f MiB for more\n", n, want,
                 mo.moe_cache_bytes / 1048576.0, (mo.moe_cache_bytes - cut) / 1048576.0);
             mo.moe_cache_bytes -= cut;
             base -= cut;
-            n = (uint32_t) std::clamp<int64_t>((f0 - (int64_t) margin - base) / per, 1, want);
+            n = (uint32_t) std::clamp<int64_t>((avail - (int64_t) margin - base) / per, 1, want);
         } else if (mo.moe_cache_auto && mo.moe_cache_bytes < mo.moe_cache_max) {
             // all sessions fit: the memory they leave beyond --moe-cache-keep-mb goes to the cache. The first guess of
             // the cache (prepare_assigned_slice) keeps a headroom and counts the token embeddings, which stay in RAM, and
             // left ~1.3 GB of an 8 GB card unused; with 4 sessions every 1 GB of cache gives ~1.4 times the tokens per
             // second up to ~4.5 GB (docs/НИОКР ускорение узла.md)
             const int64_t keep = std::max<int64_t>((int64_t) mo.moe_cache_keep, (int64_t) margin);
-            int64_t add = f0 - keep - base - (int64_t) want * per;
+            int64_t add = avail - keep - base - (int64_t) want * per;
             add = std::min<int64_t>(add, (int64_t) (mo.moe_cache_max - mo.moe_cache_bytes)) & ~((int64_t) (1 << 20) - 1);
             if (add >= (64 << 20)) {
                 AN_LOG("node: the sessions leave room, the expert cache %.0f -> %.0f MiB (%.0f MiB stay free)\n",
@@ -1487,8 +1517,8 @@ static std::unique_ptr<model_part> make_node_part(const llama_model * model, mod
                 base += add;
             }
         }
-        AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the expert cache and compute buffers %.0f MiB: %u of %u sessions fit with %.0f MiB to spare\n",
-            f0 / 1048576.0, per / 1048576.0, std::max<int64_t>(base, 0) / 1048576.0, n, want, margin / 1048576.0);
+        AN_LOG("node: %.0f MiB free, a session takes %.0f MiB, the expert cache and compute buffers %.0f MiB (%.0f beyond the buffers): %u of %u sessions fit with %.0f MiB to spare\n",
+            avail / 1048576.0, per / 1048576.0, std::max<int64_t>(base, 0) / 1048576.0, other / 1048576.0, n, want, margin / 1048576.0);
     }
     return std::make_unique<model_part>(model, mo, n * n_ctx, n_threads, n_rollback, n, mo.moe_cache_bytes);
 }
