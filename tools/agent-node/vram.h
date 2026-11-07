@@ -28,14 +28,18 @@ struct vram_state {
     int64_t free   = -1; // bytes, -1: unknown (not a GPU)
     int64_t total  = -1;
     int64_t shared = -1; // shared memory used by this process, -1: unknown (not Windows)
+    int64_t pinned = 0;  // of it: the weights in pinned host memory (llama_model_pinned_size), not an overflow
 
-    // shared memory of a process without overflow: pinned buffers of the backend, a few MB
+    // shared memory of a process without overflow beyond the pinned weights: staging buffers of the backend, a few MB
     static constexpr int64_t shared_normal = 256ll << 20;
 
     // the weights or the context did not fit: bytes in shared memory, 0: they fit or unknown
-    // (elsewhere the driver fails the allocation instead: Linux has no such fallback)
+    // (elsewhere the driver fails the allocation instead: Linux has no such fallback). With --load-mode none the
+    // experts of --cpu-moe are pinned (CUDA_Host, 8.6 GB for layers 0:24 of the 35B): Windows counts them as shared
+    // memory too, and the node warned of a full video memory while it ran 1.5 times faster than with the mapped file
     int64_t over() const {
-        return shared > shared_normal ? shared : 0;
+        const int64_t rest = shared - pinned;
+        return rest > shared_normal ? rest : 0;
     }
 };
 
@@ -80,9 +84,10 @@ inline IDXGIAdapter3 * dxgi_adapter(const std::string & name) {
 }
 #endif
 
-// dev: the GPU of the node, null: no GPU (all unknown)
-inline vram_state vram_probe(ggml_backend_dev_t dev) {
+// dev: the GPU of the node, null: no GPU (all unknown); pinned: bytes of the node's weights in pinned host memory
+inline vram_state vram_probe(ggml_backend_dev_t dev, uint64_t pinned = 0) {
     vram_state v;
+    v.pinned = (int64_t) pinned;
     if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         return v;
     }

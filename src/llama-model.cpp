@@ -3776,6 +3776,18 @@ uint64_t llama_model_size(const llama_model * model) {
     return model->size();
 }
 
+uint64_t llama_model_pinned_size(const llama_model * model) {
+    uint64_t n = 0;
+    for (const auto & [buft, size] : model->memory_breakdown()) {
+        // a host buffer type of a GPU device: CUDA_Host, Vulkan_Host... (CPU, CPU_Mapped and the repacks belong to the CPU)
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (ggml_backend_buft_is_host(buft) && dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            n += size;
+        }
+    }
+    return n;
+}
+
 const char * llama_model_chat_template(const llama_model * model, const char * name) {
     const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
         : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);

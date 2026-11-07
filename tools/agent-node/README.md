@@ -94,8 +94,9 @@ results, a new conversation only its first message. The coordinator takes the re
 
 Every 30 s the node prints `agent-node: status {...}` (the app shows it) and sends the same in the heartbeat
 (`GET /v1/nodes` of the coordinator): sessions, `max_sessions`, forwards and those in shared passes, free video memory,
-and on Windows the shared memory of the node (`vram_shared_mb`, as in Task Manager). When the weights or the context
-do not fit, the Windows driver moves the rest to shared memory and the part runs several times slower: the node warns,
+and on Windows the shared memory of the node (`vram_shared_mb`, as in Task Manager), of it the weights in pinned host
+memory (`vram_pinned_mb`: with `--cpu-moe` the experts, which `--load-mode none` pins — not an overflow) and the rest
+(`vram_over_mb`). When the weights or the context do not fit, the Windows driver moves the rest to shared memory and the part runs several times slower: the node warns,
 and with layers from the coordinator (`--model-url`) it asks at once for fewer (up to two times).
 
 ## Security

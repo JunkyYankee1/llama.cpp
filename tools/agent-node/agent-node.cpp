@@ -2140,7 +2140,7 @@ static int cmd_node(const cli_args & a) {
 
         // the weights or the context went past the video memory into shared memory: the part would run several times slower.
         // Layers from the coordinator: ask for fewer (the video memory of the slice minus what did not fit and the margin)
-        const vram_state v = vram_probe(gpu);
+        const vram_state v = vram_probe(gpu, llama_model_pinned_size(srv.model.get()));
         if (v.over() == 0) {
             break;
         }
@@ -2231,7 +2231,7 @@ static int cmd_node(const cli_args & a) {
 
     // the state of the node for the app (this line every 30 s) and for the coordinator (in the heartbeat)
     auto status = [&srv, gpu]() {
-        const vram_state v = vram_probe(gpu);
+        const vram_state v = vram_probe(gpu, llama_model_pinned_size(srv.model.get()));
         int sessions;
         {
             std::lock_guard<std::mutex> lock(srv.mtx);
@@ -2252,7 +2252,9 @@ static int cmd_node(const cli_args & a) {
             j["vram_total_mb"] = v.total >> 20;
         }
         if (v.shared >= 0) {
-            j["vram_shared_mb"] = v.shared >> 20;
+            j["vram_shared_mb"] = v.shared >> 20; // as in Task Manager, with the pinned weights
+            j["vram_pinned_mb"] = v.pinned >> 20;
+            j["vram_over_mb"]   = v.over() >> 20; // what went past the video memory
         }
         return j;
     };
@@ -2267,7 +2269,7 @@ static int cmd_node(const cli_args & a) {
                 full = !full;
                 if (full) {
                     AN_LOG("warning: the video memory is full: %lld MB of the node went to shared memory, the node runs several times "
-                        "slower; close programs that use the video card\n", (long long) j.value("vram_shared_mb", 0));
+                        "slower; close programs that use the video card\n", (long long) j.value("vram_over_mb", 0));
                 } else {
                     AN_LOG("node: the layers are back in video memory\n");
                 }
