@@ -656,6 +656,11 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // Returns the bytes of the model's weights in host memory pinned by a GPU backend (e.g. CUDA_Host): with
+    // --load-mode none the weights kept on the CPU go there. On Windows the driver counts pinned memory as the
+    // process' shared GPU memory, though the weights did not spill from the video memory
+    LLAMA_API uint64_t llama_model_pinned_size(const struct llama_model * model);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
